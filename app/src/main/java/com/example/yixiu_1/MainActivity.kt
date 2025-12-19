@@ -644,105 +644,265 @@ fun AppointmentQuestionnaireScreen(
     onBack: () -> Unit,
     onSubmissionSuccess: () -> Unit
 ) {
+    // 基础信息
     var description by remember { mutableStateOf("") }
     var location by remember { mutableStateOf("") }
+
+    // 新增补充信息
+    var contactInfo by remember { mutableStateOf("") } // 联系号码
+    var deviceType by remember { mutableStateOf("") } // 设备类型
+    var deviceSystem by remember { mutableStateOf("") } // 系统
+    var deviceModel by remember { mutableStateOf("") } // 型号
+    var appointmentTime by remember { mutableStateOf("") } // 预约时间
+    var remarks by remember { mutableStateOf("") } // 备注
+
+    // 选项 (使用 Int 代表类型)
+    var contactType by remember { mutableIntStateOf(1) } // 1:QQ, 2:微信, 3:电话
+    var campus by remember { mutableIntStateOf(1) } // 1:东校区, 2:西校区, 3:南校区
+
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
 
-    Column(
+    // 定义通用输入框样式
+    val textFieldColors = TextFieldDefaults.colors(
+        focusedContainerColor = Color.White.copy(alpha = 0.9f),
+        unfocusedContainerColor = Color.White.copy(alpha = 0.8f),
+        disabledContainerColor = Color.Gray,
+        focusedIndicatorColor = Color.Transparent,
+        unfocusedIndicatorColor = Color.Transparent,
+        cursorColor = Color.Black,
+        focusedTextColor = Color.Black,
+        unfocusedTextColor = Color.Black,
+        focusedLabelColor = Color.Black,
+        unfocusedLabelColor = Color.DarkGray
+    )
+
+    // 使用 Box 作为外层容器，处理 scaffold 的 padding
+    Box(
         modifier = modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
+            .padding(16.dp), // 外边距
+        contentAlignment = Alignment.TopCenter
     ) {
-        Spacer(modifier = Modifier.height(16.dp))
-        Text(
-            "请详细描述您遇到的问题",
-            style = MaterialTheme.typography.titleLarge,
-            color = Color.White
-        )
-        Spacer(modifier = Modifier.height(16.dp))
-        OutlinedTextField(
-            value = description,
-            onValueChange = { description = it },
-            label = { Text("问题描述") },
+        // 添加白色半透明卡片背景，与 RepairDetailScreen 风格一致
+        Card(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(150.dp),
+                .verticalScroll(rememberScrollState()), // 滚动逻辑移动到卡片上
             shape = RoundedCornerShape(12.dp),
-            colors = TextFieldDefaults.colors(
-                focusedContainerColor = Color.White.copy(alpha = 0.9f),
-                unfocusedContainerColor = Color.White.copy(alpha = 0.8f),
-                disabledContainerColor = Color.Gray,
-                focusedIndicatorColor = Color.Transparent,
-                unfocusedIndicatorColor = Color.Transparent,
-            )
-        )
-        Spacer(modifier = Modifier.height(16.dp))
-        OutlinedTextField(
-            value = location,
-            onValueChange = { location = it },
-            label = { Text("详细地址（如：xx公寓/教学楼xxx）") },
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(12.dp),
-            colors = TextFieldDefaults.colors(
-                focusedContainerColor = Color.White.copy(alpha = 0.9f),
-                unfocusedContainerColor = Color.White.copy(alpha = 0.8f),
-                disabledContainerColor = Color.Gray,
-                focusedIndicatorColor = Color.Transparent,
-                unfocusedIndicatorColor = Color.Transparent,
-            )
-        )
-        Spacer(modifier = Modifier.height(32.dp))
-        Button(
-            onClick = {
-                scope.launch {
-                    val userId = userPreferences.userId
-                    if (userId == -1) {
-                        Toast.makeText(context, "请先登录", Toast.LENGTH_SHORT).show()
-                        return@launch
-                    }
-                    if (description.isBlank() || location.isBlank()) {
-                        Toast.makeText(context, "请填写所有字段", Toast.LENGTH_SHORT).show()
-                        return@launch
-                    }
-                    try {
-                        // 修复：使用正确的参数构造请求对象
-                        val request = RepairTaskRequest(
-                            userId = userId,
-                            contactType = 0, // 默认值
-                            contactInfo = "", // 默认值
-                            deviceType = "", // 默认值
-                            deviceSystem = "", // 默认值
-                            deviceModel = "", // 默认值
-                            problemDescription = description,
-                            campus = 0, // 默认值
-                            repairLocation = location,
-                            appointmentTime = "", // 默认值
-                            remarks = null // 默认值
-                        )
-                        val response = NetworkClient.instance.submitRepairTask(request)
-                        if (response.isSuccessful) {
-                            Toast.makeText(context, "提交成功", Toast.LENGTH_SHORT).show()
-                            onSubmissionSuccess()
-                        } else {
-                            val errorBody = response.errorBody()?.string() ?: "提交失败"
-                            Toast.makeText(context, errorBody, Toast.LENGTH_SHORT).show()
+            colors = CardDefaults.cardColors(
+                containerColor = Color.White.copy(alpha = 0.9f) // 白色半透明背景
+            ),
+            elevation = CardDefaults.cardElevation(4.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp), // 卡片内部内边距
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    "请详细填写报修单",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = Color.Black // 调整文字颜色为黑色以适应白色背景
+                )
+
+                Spacer(modifier = Modifier.height(24.dp))
+
+                // 1. 问题描述
+                OutlinedTextField(
+                    value = description,
+                    onValueChange = { description = it },
+                    label = { Text("问题描述 (必填)") },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(120.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = textFieldColors
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // 2. 校区选择
+                Text("选择校区", color = Color.Black, modifier = Modifier.align(Alignment.Start))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+                    listOf("南校区" to 1, "北校区" to 2).forEach { (name, value) ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.clickable { campus = value }
+                        ) {
+                            RadioButton(
+                                selected = (campus == value),
+                                onClick = { campus = value },
+                                // 使用默认颜色或深色，确保在白色背景上可见
+                                colors = RadioButtonDefaults.colors(
+                                    selectedColor = MaterialTheme.colorScheme.primary,
+                                    unselectedColor = Color.Gray
+                                )
+                            )
+                            Text(name, color = Color.Black, style = MaterialTheme.typography.bodySmall)
                         }
-                    } catch (e: Exception) {
-                        Toast.makeText(context, "网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
+                        Spacer(modifier = Modifier.width(8.dp))
                     }
                 }
-            },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(50.dp)
-        ) {
-            Text("提交申请", style = MaterialTheme.typography.titleMedium)
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // 3. 详细地址
+                OutlinedTextField(
+                    value = location,
+                    onValueChange = { location = it },
+                    label = { Text("详细地址 (如：xx公寓xxx)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = textFieldColors
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // 4. 联系方式
+                Text("联系方式类型", color = Color.Black, modifier = Modifier.align(Alignment.Start))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+                    listOf("QQ" to 1, "微信" to 2).forEach { (name, value) ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.clickable { contactType = value }
+                        ) {
+                            RadioButton(
+                                selected = (contactType == value),
+                                onClick = { contactType = value },
+                                colors = RadioButtonDefaults.colors(
+                                    selectedColor = MaterialTheme.colorScheme.primary,
+                                    unselectedColor = Color.Gray
+                                )
+                            )
+                            Text(name, color = Color.Black, style = MaterialTheme.typography.bodySmall)
+                        }
+                        Spacer(modifier = Modifier.width(16.dp))
+                    }
+                }
+
+                OutlinedTextField(
+                    value = contactInfo,
+                    onValueChange = { contactInfo = it },
+                    label = { Text("联系号码/ID (必填)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = textFieldColors
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // 5. 设备信息
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedTextField(
+                        value = deviceType,
+                        onValueChange = { deviceType = it },
+                        label = { Text("设备类型 (如电脑)") },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = textFieldColors
+                    )
+                    OutlinedTextField(
+                        value = deviceSystem,
+                        onValueChange = { deviceSystem = it },
+                        label = { Text("系统 (如Win10)") },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = textFieldColors
+                    )
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = deviceModel,
+                    onValueChange = { deviceModel = it },
+                    label = { Text("设备型号 (选填)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = textFieldColors
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // 6. 预约时间
+                OutlinedTextField(
+                    value = appointmentTime,
+                    onValueChange = { appointmentTime = it },
+                    label = { Text("期望预约时间") },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = textFieldColors
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // 7. 备注
+                OutlinedTextField(
+                    value = remarks,
+                    onValueChange = { remarks = it },
+                    label = { Text("备注 (选填)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = textFieldColors
+                )
+
+                Spacer(modifier = Modifier.height(32.dp))
+
+                Button(
+                    onClick = {
+                        scope.launch {
+                            val userId = userPreferences.userId
+                            if (userId == -1) {
+                                Toast.makeText(context, "请先登录", Toast.LENGTH_SHORT).show()
+                                return@launch
+                            }
+                            if (description.isBlank() || location.isBlank() || contactInfo.isBlank()) {
+                                Toast.makeText(context, "请填写必填项(描述、地址、联系方式)", Toast.LENGTH_SHORT).show()
+                                return@launch
+                            }
+                            try {
+                                // 构造完整的请求对象
+                                val request = RepairTaskRequest(
+                                    userId = userId,
+                                    contactType = contactType,
+                                    contactInfo = contactInfo,
+                                    deviceType = deviceType,
+                                    deviceSystem = deviceSystem,
+                                    deviceModel = deviceModel,
+                                    problemDescription = description,
+                                    campus = campus,
+                                    repairLocation = location,
+                                    appointmentTime = appointmentTime,
+                                    remarks = remarks.ifBlank { null }
+                                )
+                                val response = NetworkClient.instance.submitRepairTask(request)
+                                if (response.isSuccessful) {
+                                    Toast.makeText(context, "提交成功", Toast.LENGTH_SHORT).show()
+                                    onSubmissionSuccess()
+                                } else {
+                                    val errorBody = response.errorBody()?.string() ?: "提交失败"
+                                    Toast.makeText(context, errorBody, Toast.LENGTH_SHORT).show()
+                                }
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(50.dp)
+                ) {
+                    Text("提交申请", style = MaterialTheme.typography.titleMedium)
+                }
+            }
         }
     }
 }
+
+
 
 @Composable
 fun RepairHistoryScreen(
