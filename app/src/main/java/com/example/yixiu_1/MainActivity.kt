@@ -7,6 +7,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.*
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -42,7 +43,9 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.example.yixiu_1.data.UserPreferences
 import com.example.yixiu_1.network.EmailRegisterOrLoginRequest
 import com.example.yixiu_1.network.NetworkClient
@@ -53,6 +56,10 @@ import com.example.yixiu_1.ui.theme.YIXIU_1Theme
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import java.io.File
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.MultipartBody
+import okhttp3.RequestBody.Companion.asRequestBody
+import kotlin.text.toIntOrNull
 
 // ===================== 1. MainActivity =====================
 class MainActivity : ComponentActivity() {
@@ -115,14 +122,47 @@ fun AvatarImage(
     modifier: Modifier = Modifier,
     defaultTint: Color = Color.Gray
 ) {
-    val file = remember(path) { path?.let { File(it).takeIf { f -> f.exists() } } }
-    if (file != null) {
-        AsyncImage(
-            model = file,
-            contentDescription = "Avatar",
-            modifier = modifier.clip(CircleShape),
-            contentScale = ContentScale.Crop
-        )
+    // 【新增】获取 Context 和 UserPreferences 以便读取 Token
+    val context = LocalContext.current
+    val userPreferences = remember { UserPreferences(context) }
+    val token = userPreferences.token
+
+    if (!path.isNullOrBlank()) {
+        Box(modifier = modifier) {
+            // 底层：占位图标
+            Icon(
+                imageVector = Icons.Default.AccountCircle,
+                contentDescription = null,
+                modifier = Modifier.matchParentSize(),
+                tint = defaultTint
+            )
+            // 上层：网络图片
+            AsyncImage(
+                // 【修改】使用 ImageRequest 构建器，添加 Authorization Header 和监听器
+                model = ImageRequest.Builder(context)
+                    .data(path)
+                    .crossfade(true) // 淡入效果
+                    .apply {
+                        // 【关键修改】如果存在 Token，将其添加到请求头 Authorization 中
+                        // 这样服务器才能通过鉴权返回图片
+                        if (!token.isNullOrBlank()) {
+                            addHeader("Authorization", token)
+                        }
+                    }
+                    .listener(
+                        onStart = { Log.d("AvatarImage", "开始加载头像: $path") },
+                        onSuccess = { _, _ -> Log.d("AvatarImage", "头像加载成功") },
+                        onError = { _, result ->
+                            Log.e("AvatarImage", "头像加载失败: $path")
+                            Log.e("AvatarImage", "错误原因: ${result.throwable.localizedMessage}", result.throwable)
+                        }
+                    )
+                    .build(),
+                contentDescription = "Avatar",
+                modifier = Modifier.matchParentSize().clip(CircleShape),
+                contentScale = ContentScale.Crop
+            )
+        }
     } else {
         Icon(
             imageVector = Icons.Default.AccountCircle,
@@ -132,6 +172,8 @@ fun AvatarImage(
         )
     }
 }
+
+
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalSharedTransitionApi::class)
 @Composable
@@ -275,8 +317,7 @@ private fun AppContentInternal(
                             topBar = {
                                 StandardTopAppBar(
                                     title = "义修校园",
-                                    drawerState = drawerState,
-                                    scope = scope,
+                                    drawerState = drawerState,scope = scope,
                                     isLoggedIn = isLoggedIn,
                                     avatarPath = avatarPath,
                                     sharedTransitionScope = sharedTransitionScope,
@@ -286,11 +327,54 @@ private fun AppContentInternal(
                             },
                             containerColor = Color.Transparent
                         ) { innerPadding ->
+                            // 使用 Box 来进行绝对定位
                             Box(
-                                Modifier
+                                modifier = Modifier
                                     .padding(innerPadding)
-                                    .fillMaxSize(), contentAlignment = Alignment.Center) {
-                                Text("欢迎来到义修校园", style = MaterialTheme.typography.headlineMedium, color = Color.White)
+                                    .fillMaxSize()
+                            ) {
+                                // 计算模糊半径，复用之前定义的 blurRadius 逻辑
+                                // 注意：这里需要确保能访问到外层的 blurRadius 变量。
+                                // 如果访问不到，可以直接在这里重新计算：
+                                val cardBlurRadius by animateDpAsState(
+                                    targetValue = if (drawerState.isOpen) 10.dp else 0.dp,
+                                    animationSpec = tween(300), label = "cardBlur"
+                                )
+
+                                val cardModifier = if (cardBlurRadius > 0.dp) {
+                                    // 仅在侧边栏打开时应用模糊
+                                    Modifier.blur(cardBlurRadius)
+                                } else {
+                                    Modifier
+                                }
+                                val configuration = LocalConfiguration.current
+                                val screenHeight = configuration.screenHeightDp
+                                Card(
+                                    modifier = cardModifier
+                                        .align(Alignment.TopCenter) // 先顶部居中
+                                        // 使用 padding 来模拟 61.8% 的位置 (黄金分割点)
+                                        // fillMaxHeight(0.618f) 会让它顶部的 spacer 占位，或者直接用 BiasAlignment
+                                        .padding(top = (screenHeight * 0.1).dp)
+                                        .padding(horizontal = 32.dp), // 水平边距
+                                    colors = CardDefaults.cardColors(
+                                        // 白色半透明背景 (0.8f 不透明度)
+                                        containerColor = Color.White.copy(alpha = 0.8f)
+                                    ),
+                                    shape = RoundedCornerShape(16.dp),
+                                    elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier.padding(vertical = 24.dp, horizontal = 32.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(
+                                            text = "欢迎使用义修校园",
+                                            style = MaterialTheme.typography.headlineSmall,
+                                            color = Color.Black, // 黑色字体
+                                            fontWeight = FontWeight.Bold // 加粗
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -457,19 +541,15 @@ fun ExpandableNavigationItem(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, onLoginSuccess: () -> Unit) {
+    val context = LocalContext.current
     var email by remember { mutableStateOf("") }
-    // 注意：EmailRegisterOrLoginRequest 数据类中没有 password，所以移除密码输入框，只使用验证码
     var verificationCode by remember { mutableStateOf("") }
     var isLoginMode by remember { mutableStateOf(true) }
     var isLoading by remember { mutableStateOf(false) }
     var countdown by remember { mutableIntStateOf(0) }
-    var authCodeSent by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
-    val context = LocalContext.current
 
-    // 身份选项
     val roleOptions = listOf("学生" to "student", "志愿者" to "volunteer", "管理员" to "super_admin")
-    // 角色状态，默认学生
     var selectedRole by remember { mutableStateOf("student") }
 
     LaunchedEffect(countdown) {
@@ -479,231 +559,161 @@ fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, 
         }
     }
 
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        if (isLoginMode) {
-            Text("登录", style = MaterialTheme.typography.headlineMedium, color = Color.White)
-        } else {
-            Text("注册", style = MaterialTheme.typography.headlineMedium, color = Color.White)
-        }
-
-        Spacer(Modifier.height(32.dp))
-
-        // 身份选择 UI
-        Text("选择您的身份", style = MaterialTheme.typography.titleSmall, color = Color.White)
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.Center,
-            verticalAlignment = Alignment.CenterVertically
+    Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(0.9f).wrapContentHeight(),
+            shape = RoundedCornerShape(16.dp),
+            color = Color.Black.copy(alpha = 0.6f)
         ) {
-            roleOptions.forEach { (displayName, roleValue) ->
-                Row(
-                    modifier = Modifier
-                        .clickable { selectedRole = roleValue }
-                        .padding(horizontal = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    RadioButton(
-                        selected = (selectedRole == roleValue),
-                        onClick = { selectedRole = roleValue },
-                        colors = RadioButtonDefaults.colors(
-                            selectedColor = Color.White,
-                            unselectedColor = Color.White.copy(alpha = 0.7f)
-                        )
-                    )
-                    Text(text = displayName, color = Color.White, style = MaterialTheme.typography.bodySmall)
-                }
-            }
-        }
-        Spacer(Modifier.height(16.dp))
-
-        OutlinedTextField(
-            value = email,
-            onValueChange = { email = it },
-            label = { Text("邮箱") },
-            modifier = Modifier.fillMaxWidth(),
-            colors = TextFieldDefaults.colors(
-                focusedContainerColor = Color.White.copy(alpha = 0.1f),
-                unfocusedContainerColor = Color.White.copy(alpha = 0.1f),
-                disabledContainerColor = Color.Gray,
-                focusedIndicatorColor = Color.White,
-                unfocusedIndicatorColor = Color.White.copy(alpha = 0.7f),
-                focusedLabelColor = Color.White,
-                unfocusedLabelColor = Color.White.copy(alpha = 0.7f),
-                cursorColor = Color.White,
-                focusedTextColor = Color.White,
-                unfocusedTextColor = Color.White
-            )
-        )
-
-        Spacer(Modifier.height(16.dp))
-
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            OutlinedTextField(
-                value = verificationCode,
-                onValueChange = { verificationCode = it },
-                label = { Text("验证码") },
-                modifier = Modifier.weight(1f),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                colors = TextFieldDefaults.colors(
-                    focusedContainerColor = Color.White.copy(alpha = 0.1f),
-                    unfocusedContainerColor = Color.White.copy(alpha = 0.1f),
-                    disabledContainerColor = Color.Gray,
-                    focusedIndicatorColor = Color.White,
-                    unfocusedIndicatorColor = Color.White.copy(alpha = 0.7f),
-                    focusedLabelColor = Color.White,
-                    unfocusedLabelColor = Color.White.copy(alpha = 0.7f),
-                    cursorColor = Color.White,
-                    focusedTextColor = Color.White,
-                    unfocusedTextColor = Color.White
-                )
-            )
-            Spacer(Modifier.width(8.dp))
-            Button(
-                onClick = {
-                    scope.launch {
-                        if (email.isBlank()) {
-                            Toast.makeText(context, "请输入邮箱", Toast.LENGTH_SHORT).show()
-                            return@launch
-                        }
-
-                        // 点击后立即开始倒计时
-                        countdown = 60
-
-                        try {
-                            val response = NetworkClient.instance.sendEmailVerification(email)
-                            if (response.isSuccessful) {
-                                Toast.makeText(context, "验证码已发送", Toast.LENGTH_SHORT).show()
-                            } else {
-                                Toast.makeText(context, "发送失败: ${response.code()}", Toast.LENGTH_SHORT).show()
-                                // 发送失败可以选择重置倒计时，也可以维持倒计时防止刷接口
-                                // countdown = 0
-                            }
-                        } catch (e: Exception) {
-                            Toast.makeText(context, "发送错误: ${e.message}", Toast.LENGTH_SHORT).show()
-                            // 网络错误建议重置倒计时，方便用户重试
-                            countdown = 0
-                        }
-                    }
-                },
-                //modifier = Modifier.fillMaxWidth(),
-                // 【关键修改】如果正在加载 OR 正在倒计时(>0)，则禁用按钮
-                enabled = !isLoading && countdown == 0
+            Column(
+                modifier = Modifier.padding(24.dp).verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
             ) {
-                // 【关键修改】根据倒计时状态显示文本
-                if (countdown > 0) {
-                    Text("${countdown}s 后重试")
-                } else {
-                    Text("获取验证码")
-                }
-            }
+                Text(if (isLoginMode) "登录" else "注册", style = MaterialTheme.typography.headlineMedium, color = Color.White)
+                Spacer(Modifier.height(24.dp))
 
-        }
-
-        Spacer(Modifier.height(32.dp))
-
-        Button(
-            onClick = {
-                scope.launch {
-                    try {
-                        val codeInt = verificationCode.toIntOrNull()
-                        if (codeInt == null) {
-                            Toast.makeText(context, "请输入有效的数字验证码", Toast.LENGTH_SHORT).show()
-                            return@launch
+                Text("选择您的身份", style = MaterialTheme.typography.titleSmall, color = Color.White)
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+                    roleOptions.forEach { (displayName, roleValue) ->
+                        Row(modifier = Modifier.clickable { selectedRole = roleValue }.padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                            RadioButton(
+                                selected = (selectedRole == roleValue),
+                                onClick = { selectedRole = roleValue },
+                                colors = RadioButtonDefaults.colors(selectedColor = Color.White, unselectedColor = Color.White.copy(alpha = 0.7f))
+                            )
+                            Text(text = displayName, color = Color.White, style = MaterialTheme.typography.bodySmall)
                         }
-
-                        // 【匹配数据类】EmailRegisterOrLoginRequest 包含 email, role, verificationCode
-                        val request = EmailRegisterOrLoginRequest(
-                            email = email,
-                            role = selectedRole,
-                            verificationCode = codeInt
-                        )
-
-                        val response = if (isLoginMode) {
-                            NetworkClient.instance.loginByEmail(request)
-                        } else {
-                            NetworkClient.instance.registerByEmail(request)
-                        }
-
-                        if (response.isSuccessful) {
-                            // 假设 ApiResponse 的 data 返回的是 Token 字符串或者包含 token 的 Map
-                            // 这里需要根据您的实际 AuthResponse 结构调整。
-                            // 为了兼容，我们假设如果成功，我们需要手动获取 UserInfo
-                            val responseData = response.body()?.data
-
-                            var tempToken: String? = null
-                            // 尝试解析 token，这里可能需要根据实际情况调整
-                            if (responseData is Map<*, *>) {
-                                tempToken = responseData["token"] as? String
-                            } else if (responseData is String) {
-                                tempToken = responseData
-                            }
-
-                            // 如果没直接拿到 token，可能在 Header 里，或者需要额外逻辑。
-                            // 暂时假设我们通过某种方式拿到了 token。如果这里始终失败，请检查登录返回的具体 JSON。
-                            // 由于 NetworkClient.setToken 已经存在，我们假设后端返回的 Map 中包含 "token"
-
-                            if (tempToken != null) {
-                                userPreferences.token = tempToken
-                                NetworkClient.setToken(tempToken)
-
-                                // 登录成功后，立即获取用户信息
-                                try {
-                                    val userResp = NetworkClient.instance.getUserInfo()
-                                    if (userResp.isSuccessful) {
-                                        val userInfo = userResp.body()?.data
-                                        if (userInfo != null) {
-                                            userPreferences.isLoggedIn = true // 别忘了设置登录状态
-                                            userPreferences.token = tempToken
-                                            userPreferences.userId = userInfo.userId
-                                            userPreferences.nickname = userInfo.username
-                                            userPreferences.userEmail = userInfo.email
-                                            userPreferences.avatarPath = userInfo.avatar
-                                            userPreferences.userRole = userInfo.role
-                                        }
-                                    }
-                                } catch (e: Exception) {
-                                    Log.e("Auth", "Failed to get user info", e)
-                                }
-
-                                Toast.makeText(context, if (isLoginMode) "登录成功" else "注册成功", Toast.LENGTH_SHORT).show()
-                                onLoginSuccess()
-                            } else {
-                                // 备用方案：如果注册不返回 token，提示去登录
-                                if (!isLoginMode) {
-                                    Toast.makeText(context, "注册成功，请登录", Toast.LENGTH_SHORT).show()
-                                    isLoginMode = true // 切换到登录模式
-                                } else {
-                                    // 登录但没拿到 token，尝试直接获取 UserInfo (有些后端可能通过 Cookie 鉴权)
-                                    // 或者提示错误
-                                    Toast.makeText(context, "登录响应未包含令牌", Toast.LENGTH_SHORT).show()
-                                }
-                            }
-                        } else {
-                            val errorBody = response.errorBody()?.string() ?: "未知错误"
-                            Toast.makeText(context, "操作失败: $errorBody", Toast.LENGTH_SHORT).show()
-                        }
-                    } catch (e: Exception) {
-                        Toast.makeText(context, "网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
                     }
                 }
-            },
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text(if (isLoginMode) "登录" else "注册")
-        }
+                Spacer(Modifier.height(16.dp))
 
-        TextButton(onClick = { isLoginMode = !isLoginMode }) {
-            Text(if (isLoginMode) "没有账户？去注册" else "已有账户？去登录", color = Color.White)
+                OutlinedTextField(
+                    value = email,
+                    onValueChange = { email = it },
+                    label = { Text("邮箱", color = Color.White.copy(alpha = 0.8f)) },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = TextFieldDefaults.colors(
+                        focusedContainerColor = Color.Transparent,
+                        unfocusedContainerColor = Color.Transparent,
+                        focusedIndicatorColor = Color.White,
+                        unfocusedIndicatorColor = Color.White.copy(alpha = 0.5f),
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White
+                    ),
+                    singleLine = true
+                )
+                Spacer(Modifier.height(16.dp))
+
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    OutlinedTextField(
+                        value = verificationCode,
+                        onValueChange = { verificationCode = it },
+                        label = { Text("验证码", color = Color.White.copy(alpha = 0.8f)) },
+                        modifier = Modifier.weight(1f),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        colors = TextFieldDefaults.colors(
+                            focusedContainerColor = Color.Transparent,
+                            unfocusedContainerColor = Color.Transparent,
+                            focusedIndicatorColor = Color.White,
+                            unfocusedIndicatorColor = Color.White.copy(alpha = 0.5f),
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White
+                        ),
+                        singleLine = true
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                if (email.isBlank()) {
+                                    Toast.makeText(context, "请输入邮箱", Toast.LENGTH_SHORT).show()
+                                    return@launch
+                                }
+                                countdown = 60
+                                try {
+                                    val response = NetworkClient.instance.sendEmailVerification(email)
+                                    if (response.isSuccessful) Toast.makeText(context, "验证码已发送", Toast.LENGTH_SHORT).show()
+                                    else Toast.makeText(context, "发送失败: ${response.code()}", Toast.LENGTH_SHORT).show()
+                                } catch (e: Exception) {
+                                    Toast.makeText(context, "发送错误: ${e.message}", Toast.LENGTH_SHORT).show()
+                                    countdown = 0
+                                }
+                            }
+                        },
+                        enabled = !isLoading && countdown == 0
+                    ) { Text(if (countdown > 0) "${countdown}s" else "获取") }
+                }
+
+                Spacer(Modifier.height(24.dp))
+                Button(
+                    onClick = {
+                        scope.launch {
+                            isLoading = true
+                            try {
+                                val codeInt = verificationCode.toIntOrNull() ?: 0
+                                // 【修复】这里将 authCode 改为 code，匹配常见的数据类定义
+                                val request = EmailRegisterOrLoginRequest(email = email, role = selectedRole, verificationCode = codeInt)
+                                val resp = if (isLoginMode) NetworkClient.instance.loginByEmail(request) else NetworkClient.instance.registerByEmail(request)
+                                val token = (resp.body()?.data as? String) ?: (resp.body()?.data as? Map<*, *>)?.get("token") as? String
+
+                                if (token != null) {
+                                    userPreferences.token = token
+                                    NetworkClient.setToken(token)
+                                    userPreferences.isLoggedIn = true
+
+                                    // 【头像逻辑】登录后获取用户信息，并使用其中的 avatar 字段更新头像
+                                    try {
+                                        val uResp = NetworkClient.instance.getUserInfo()
+                                        // 假设 getUserInfo 返回的是 ApiResponse<UserInfo>
+                                        val userInfo = uResp.body()?.data
+                                        if (userInfo != null) {
+                                            // 注意：这里需要根据你实际的 UserInfo 类结构进行取值
+                                            // 如果是 Any 类型需要强转，如果是泛型则直接使用
+                                            // 这里假设 userInfo 对象中有 avatar 属性
+                                            // 且 userId 是 String 类型 (如果不是请转 .toString())
+                                            // userPreferences.userId = userInfo.userId.toString()
+                                            // ...
+
+                                            // 使用反射或者直接访问（取决于你的 UserInfo 定义）
+                                            // 简单起见，这里假设它就是那个对象
+                                            if (userInfo is com.example.yixiu_1.network.UserInfo) {
+                                                userPreferences.userId = userInfo.userId
+
+                                                userPreferences.userEmail = userInfo.email
+                                                userPreferences.nickname = userInfo.username
+                                                userPreferences.userRole = userInfo.role
+                                                // 更新头像
+                                                userPreferences.avatarPath = userInfo.avatar
+                                            }
+                                        }
+                                    } catch (e: Exception) {
+                                        Log.e("Auth", "Fetch user info failed", e)
+                                    }
+
+                                    onLoginSuccess()
+                                    Toast.makeText(context, if (isLoginMode) "登录成功" else "注册成功", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Toast.makeText(context, "操作失败: ${resp.body()?.msg ?: "未知错误"}", Toast.LENGTH_SHORT).show()
+                                }
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "错误: ${e.message}", Toast.LENGTH_SHORT).show()
+                            } finally { isLoading = false }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isLoading
+                ) { Text(if (isLoginMode) "登录" else "注册") }
+
+                TextButton(onClick = { isLoginMode = !isLoginMode }) {
+                    Text(if (isLoginMode) "没有账户？去注册" else "已有账户？去登录", color = Color.White)
+                }
+            }
         }
     }
 }
+
+
 
 
 @Composable

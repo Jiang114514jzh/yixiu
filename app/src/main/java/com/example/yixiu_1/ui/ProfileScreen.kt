@@ -29,11 +29,18 @@ import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import com.example.yixiu_1.data.UserPreferences
+import com.example.yixiu_1.network.NetworkClient
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.MultipartBody
+import okhttp3.RequestBody.Companion.asRequestBody
+
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalSharedTransitionApi::class)
 @Composable
@@ -60,40 +67,70 @@ fun ProfileScreen(
     val imagePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
-        uri?.let {
+        uri ?: return@rememberLauncherForActivityResult
+
+        scope.launch {
             try {
-                val inputStream: InputStream? = context.contentResolver.openInputStream(it)
+                // 1. 将用户选择的图片复制到 App 的内部缓存目录
+                val inputStream = context.contentResolver.openInputStream(uri)
                 if (inputStream == null) {
-                    Toast.makeText(context, "无法读取图片文件", Toast.LENGTH_SHORT).show()
-                    return@let
+                    Toast.makeText(context, "无法读取图片", Toast.LENGTH_SHORT).show()
+                    return@launch
                 }
-                val avatarFile = File(context.filesDir, "avatar_${System.currentTimeMillis()}.jpg")
-                val outputStream = FileOutputStream(avatarFile)
-                try {
-                    inputStream.use { input ->
-                        outputStream.use { output ->
-                            input.copyTo(output)
-                        }
-                    }
-                    val savedPath = avatarFile.absolutePath
-                    if (avatarFile.exists() && avatarFile.canRead()) {
-                        userPreferences.avatarPath = savedPath
-                        avatarPath = savedPath
-                        onAvatarUpdated(savedPath)
-                        Toast.makeText(context, "头像上传成功", Toast.LENGTH_SHORT).show()
+
+                val imageFile = File(context.cacheDir, "upload_avatar.jpg")
+                Log.d("AvatarDebug", "1. 文件准备完毕: 路径=${imageFile.absolutePath}, 大小=${imageFile.length()} 字节")
+                val outputStream = FileOutputStream(imageFile)
+                inputStream.use { input -> outputStream.use { output -> input.copyTo(output) } }
+                if (imageFile.length() > 1024 * 1024) {
+                    Toast.makeText(context, "图片大小不能超过1MB，请重新选择", Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
+                // 2. 构建上传请求
+                val requestFile = imageFile.asRequestBody("image/jpeg".toMediaTypeOrNull())
+                // 'avatar' 是后端指定的参数名，imageFile.name 是文件名
+                val body = MultipartBody.Part.createFormData("avatar", imageFile.name, requestFile)
+                Log.d("AvatarDebug", "2. 构建MultipartBody: filename=${imageFile.name}, mediaType=image/jpeg")
+                // 3. 调用上传接口
+                Log.d("AvatarUpload", "开始上传头像...")
+                val response = NetworkClient.instance.uploadAvatar(body)
+
+                if (!response.isSuccessful) {
+                    Log.d("AvatarDebug", "4. 上传失败原因: ${response.errorBody()?.string()}")
+                }
+
+                if (response.isSuccessful) {
+                    Toast.makeText(context, "头像上传成功", Toast.LENGTH_SHORT).show()
+                    Log.d("AvatarDebug", "5. 上传成功，服务器返回Body: ${response.body()}")
+                    // 4. 【关键修复】上传成功后，重新获取用户信息以拿到最新的头像 URL
+                    val userResp = NetworkClient.instance.getUserInfo()
+                    val userInfo = userResp.body()?.data
+                    val serverAvatarUrl = userInfo?.avatar
+                    Log.d("AvatarDebug", "6. getUserInfo 返回的原始 avatar 字段: '${userInfo?.avatar}'")
+
+                    if (!serverAvatarUrl.isNullOrBlank()) {
+                        // 加上时间戳破坏缓存，确保显示最新图片
+                        val finalUrl = "$serverAvatarUrl?t=${System.currentTimeMillis()}"
+
+                        // 更新状态以刷新UI
+                        avatarPath = finalUrl
+                        // 更新 UserPreferences 持久化保存
+                        userPreferences.avatarPath = finalUrl
+                        // 回调给 MainActivity 更新顶栏图标
+                        onAvatarUpdated(finalUrl)
+                        Log.d("AvatarUpload", "头像更新为: $finalUrl")
                     } else {
-                        Toast.makeText(context, "头像文件保存失败", Toast.LENGTH_SHORT).show()
+                        Log.w("AvatarUpload", "上传成功但未获取到新头像链接")
                     }
-                } catch (e: Exception) {
-                    // 清理可能创建的不完整文件
-                    if (avatarFile.exists()) {
-                        avatarFile.delete()
-                    }
-                    throw e
+
+                } else {
+                    val errorBody = response.errorBody()?.string()
+                    Toast.makeText(context, "上传失败: $errorBody", Toast.LENGTH_SHORT).show()
+                    Log.e("AvatarUpload", "上传失败: $errorBody")
                 }
             } catch (e: Exception) {
-                Log.e("ProfileScreen", "头像上传失败", e)
-                Toast.makeText(context, "头像上传失败: ${e.message ?: "未知错误"}", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "处理图片出错: ${e.message}", Toast.LENGTH_SHORT).show()
+                Log.e("AvatarUpload", "上传异常", e)
             }
         }
     }
@@ -113,62 +150,18 @@ fun ProfileScreen(
                 verticalArrangement = Arrangement.spacedBy(24.dp)
             ) {
                 Spacer(modifier = Modifier.height(64.dp))
-
-                val avatarFile = remember(avatarPath) {
-                    avatarPath?.let { File(it) }?.takeIf { it.exists() && it.canRead() }
-                }
-
-                if (isLoggedIn) {
-                    if (avatarFile != null) {
-                        // 使用 AsyncImage，Coil 会自动处理加载和错误状态
-                        AsyncImage(
-                            model = avatarFile,
-                            contentDescription = "用户头像",
-                            modifier = Modifier
-                                .size(120.dp)
-                                .sharedElement(
-                                    state = rememberSharedContentState(key = "avatar"),
-                                    animatedVisibilityScope = animatedContentScope,
-                                    boundsTransform = { _, _ ->
-                                        tween(durationMillis = 500)
-                                    }
-                                )
-                                .clip(CircleShape),
-                            contentScale = ContentScale.Crop
+                AvatarImage(
+                    path = if (isLoggedIn) avatarPath else null,
+                    modifier = Modifier
+                        .size(120.dp)
+                        .sharedElement(
+                            state = rememberSharedContentState(key = "avatar"),
+                            animatedVisibilityScope = animatedContentScope,
+                            boundsTransform = { _, _ ->
+                                tween(durationMillis = 500)
+                            }
                         )
-                    } else {
-                        Icon(
-                            imageVector = Icons.Filled.AccountCircle,
-                            contentDescription = "默认头像",
-                            modifier = Modifier
-                                .size(120.dp)
-                                .sharedElement(
-                                    state = rememberSharedContentState(key = "avatar"),
-                                    animatedVisibilityScope = animatedContentScope,
-                                    boundsTransform = { _, _ ->
-                                        tween(durationMillis = 500)
-                                    }
-                                ),
-                            tint = Color.Gray
-                        )
-                    }
-                } else {
-                    // 【关键修复】为未登录状态的 Icon 添加了 sharedElement 修饰符
-                    Icon(
-                        imageVector = Icons.Filled.AccountCircle,
-                        contentDescription = "未登录头像",
-                        modifier = Modifier
-                            .size(120.dp)
-                            .sharedElement( // <--- 此处是核心改动
-                                state = rememberSharedContentState(key = "avatar"),
-                                animatedVisibilityScope = animatedContentScope,
-                                boundsTransform = { _, _ ->
-                                    tween(durationMillis = 500)
-                                }
-                            ),
-                        tint = Color.Gray
-                    )
-                }
+                )
 
                 if (isLoggedIn) {
                     if (isEditingNickname) {
@@ -271,5 +264,64 @@ fun ProfileScreen(
                 )
             }
         }
+    }
+}
+
+@Composable
+fun AvatarImage(
+    path: String?,
+    modifier: Modifier = Modifier,
+    defaultTint: Color = Color.Gray
+) {
+    val context = LocalContext.current
+    // 获取 Token 用于请求头
+    val userPreferences = remember { UserPreferences(context) }
+    val token = userPreferences.token
+
+    if (!path.isNullOrBlank()) {
+        Box(modifier = modifier) {
+            // 1. 底层：灰色默认头像（作为加载中或失败时的占位符）
+            Icon(
+                imageVector = Icons.Default.AccountCircle,
+                contentDescription = null,
+                modifier = Modifier.matchParentSize(),
+                tint = defaultTint
+            )
+
+            // 2. 将矢量图转换为 Painter，供 AsyncImage 的 placeholder/error 使用
+            val placeholderPainter = rememberVectorPainter(Icons.Default.AccountCircle)
+
+            // 3. 上层：网络图片
+            AsyncImage(
+                model = ImageRequest.Builder(context)
+                    .data(path)
+                    .crossfade(true)
+                    .apply {
+                        // 添加鉴权 Token
+                        if (!token.isNullOrBlank()) {
+                            addHeader("Authorization", token)
+                        }
+                    }
+                    .listener(
+                        onError = { _, result ->
+                            Log.e("AvatarImage", "加载失败: ${result.throwable.message}")
+                        }
+                    )
+                    .build(),
+                contentDescription = "Avatar",
+                modifier = Modifier
+                    .matchParentSize()
+                    .clip(CircleShape),
+                contentScale = ContentScale.Crop
+            )
+        }
+    } else {
+        // 路径为空时直接显示图标
+        Icon(
+            imageVector = Icons.Default.AccountCircle,
+            contentDescription = "Avatar",
+            modifier = modifier,
+            tint = defaultTint
+        )
     }
 }

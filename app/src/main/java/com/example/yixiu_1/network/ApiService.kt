@@ -1,14 +1,18 @@
 package com.example.yixiu_1.network
 
+import okhttp3.MultipartBody
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Response
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
+import retrofit2.http.Multipart
 import retrofit2.http.Body
 import retrofit2.http.GET
 import retrofit2.http.POST
+import retrofit2.http.PUT
+import retrofit2.http.Part
 import retrofit2.http.Query
 import java.util.concurrent.TimeUnit
 
@@ -30,6 +34,10 @@ interface ApiService {
 
     @GET("/api/v1/users/userInfo")
     suspend fun getUserInfo(): Response<ApiResponse<UserInfo>>
+
+    @Multipart
+    @PUT("/api/v1/users/avatar")
+    suspend fun uploadAvatar(@Part avatar: MultipartBody.Part): Response<ApiResponse<Any>>
 }
 
 //============ Retrofit 客户端实例 ============
