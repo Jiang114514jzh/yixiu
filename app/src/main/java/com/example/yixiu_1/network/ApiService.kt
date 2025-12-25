@@ -16,7 +16,7 @@ import java.util.concurrent.TimeUnit
 interface ApiService {
     // --- 登录注册相关接口 ---
     @GET("/api/v1/send/emailVerification")
-    suspend fun sendEmailVerification(@Query("email") email: String): Response<ApiResponse<Void>>
+    suspend fun sendEmailVerification(@Query("email") email: String): Response<ApiResponse<Any>>
 
     @POST("/api/v1/users/registerByEmail")
     suspend fun registerByEmail(@Body body: EmailRegisterOrLoginRequest): Response<ApiResponse<Any>>

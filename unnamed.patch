@@ -1,0 +1,188 @@
+Index: app/src/main/java/com/example/yixiu_1/MainActivity.kt
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/app/src/main/java/com/example/yixiu_1/MainActivity.kt b/app/src/main/java/com/example/yixiu_1/MainActivity.kt
+--- a/app/src/main/java/com/example/yixiu_1/MainActivity.kt
++++ b/app/src/main/java/com/example/yixiu_1/MainActivity.kt	(date 1766634290441)
+@@ -37,6 +37,7 @@
+ import androidx.compose.ui.layout.ContentScale
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.res.painterResource
++import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.text.input.KeyboardType
+ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.tooling.preview.Preview
+@@ -989,27 +990,37 @@
+             isLoading = false
+             return@LaunchedEffect
+         }
+-        scope.launch {
+-            try {
+-                // 如果您在 NetworkClient 中添加了 getRepairHistory(userId)，请取消注释并使用
+-                // 目前代码为了防止报错，暂时只做 Toast 提示，因为 ApiService 定义中没有该方法。
+-                // 如果 ApiService 有：
+-                /*
+-                val response = NetworkClient.instance.getRepairHistory(userId)
+-                if (response.isSuccessful) {
+-                    history = response.body()?.data ?: emptyList()
+-                } else {
+-                    Toast.makeText(context, "加载历史记录失败", Toast.LENGTH_SHORT).show()
+-                }
+-                */
+-                // 模拟数据 (防止报错)
+-                isLoading = false
+-            } catch (e: Exception) {
+-                Toast.makeText(context, "网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
+-            } finally {
+-                isLoading = false
+-            }
++        try {
++            val localHistory = userPreferences.getRepairHistory()
++            // 按提交时间倒序排序
++            history = localHistory.sortedByDescending { it.submissionDate }
++        } catch (e: Exception) {
++            // 如果读取失败，history 保持为空
++            Log.e("RepairHistory", "Error loading local history", e)
++        } finally {
++            isLoading = false
+         }
++//        scope.launch {
++//            try {
++//                // 如果您在 NetworkClient 中添加了 getRepairHistory(userId)，请取消注释并使用
++//                // 目前代码为了防止报错，暂时只做 Toast 提示，因为 ApiService 定义中没有该方法。
++//                // 如果 ApiService 有：
++//                /*
++//                val response = NetworkClient.instance.getRepairHistory(userId)
++//                if (response.isSuccessful) {
++//                    history = response.body()?.data ?: emptyList()
++//                } else {
++//                    Toast.makeText(context, "加载历史记录失败", Toast.LENGTH_SHORT).show()
++//                }
++//                */
++//                // 模拟数据 (防止报错)
++//                isLoading = false
++//            } catch (e: Exception) {
++//                Toast.makeText(context, "网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
++//            } finally {
++//                isLoading = false
++//            }
++//        }
+     }
+ 
+     Box(
+@@ -1021,7 +1032,19 @@
+         if (isLoading) {
+             CircularProgressIndicator(color = Color.White)
+         } else if (history.isEmpty()) {
+-            Text("没有维修记录", color = Color.White, style = MaterialTheme.typography.titleMedium)
++            Column(horizontalAlignment = Alignment.CenterHorizontally) {
++                Text(
++                    "暂无报修记录",
++                    color = Color.White,
++                    style = MaterialTheme.typography.titleMedium
++                )
++                Spacer(modifier = Modifier.height(8.dp))
++                Text(
++                    "提交的报修将显示在这里",
++                    color = Color.White.copy(alpha = 0.7f),
++                    style = MaterialTheme.typography.bodySmall
++                )
++            }
+         } else {
+             LazyColumn(
+                 modifier = Modifier.fillMaxSize(),
+@@ -1087,25 +1110,27 @@
+     val context = LocalContext.current
+ 
+     LaunchedEffect(taskId) {
+-        scope.launch {
+-            try {
+-                // 暂时注释掉，等待 ApiService 添加 getRepairDetail 接口
+-                // 假设接口存在且返回 RepairHistoryItem
++        try {
++            // 【关键修改】优先从本地数据中查找对应的工单
++            // 因为刚刚提交的数据保存在本地，网络接口可能还没有
++            val localHistory = userPreferences.getRepairHistory()
++            val localItem = localHistory.find { it.id == taskId }
++
++            if (localItem != null) {
++                detail = localItem
++            } else {
++                // 如果本地找不到，尝试请求网络接口 (如果已实现)
+                 /*
+                 val response = NetworkClient.instance.getRepairDetail(taskId)
+                 if (response.isSuccessful) {
+                     detail = response.body()?.data
+-                } else {
+-                    Toast.makeText(context, "加载详情失败", Toast.LENGTH_SHORT).show()
+                 }
+                 */
+-                // 模拟数据加载结束
+-                isLoading = false
+-            } catch (e: Exception) {
+-                Toast.makeText(context, "网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
+-            } finally {
+-                isLoading = false
+-            }
++            }
++        } catch (e: Exception) {
++            Toast.makeText(context, "加载详情出错: ${e.message}", Toast.LENGTH_SHORT).show()
++        } finally {
++            isLoading = false
+         }
+     }
+ 
+@@ -1118,9 +1143,8 @@
+         if (isLoading) {
+             CircularProgressIndicator(color = Color.White)
+         } else if (detail == null) {
+-            // 在没有真实网络接口时，显示提示
+             Text(
+-                "暂无详情信息 (接口开发中)",
++                "未找到该工单详情",
+                 color = Color.White,
+                 style = MaterialTheme.typography.titleMedium
+             )
+@@ -1137,21 +1161,34 @@
+                 elevation = CardDefaults.cardElevation(4.dp)
+             ) {
+                 Column(Modifier.padding(24.dp)) {
+-                    // 使用 Task.kt 中 RepairHistoryItem 实际存在的字段
++                    Text(
++                        "维修工单详情",
++                        style = MaterialTheme.typography.headlineSmall,
++                        color = MaterialTheme.colorScheme.primary
++                    )
++                    Divider(Modifier.padding(vertical = 8.dp))
++
+                     DetailRow("任务ID:", item.id)
+                     DetailRow("问题描述:", item.problemDescription)
+                     DetailRow("校区:", item.campus)
+                     DetailRow("地址:", item.repairLocation)
+-                    DetailRow("设备类型:", item.deviceType)
+-                    DetailRow("设备系统:", item.deviceSystem)
+-                    DetailRow("设备型号:", item.deviceModel)
++
++                    Spacer(modifier = Modifier.height(8.dp))
++                    Text("设备信息", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
++                    DetailRow("类型:", item.deviceType)
++                    DetailRow("型号:", item.deviceModel)
++                    DetailRow("系统:", item.deviceSystem)
++
++                    Spacer(modifier = Modifier.height(8.dp))
++                    Text("联系与预约", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                     DetailRow("联系方式:", "${item.contactType} - ${item.contactInfo}")
+                     DetailRow("预约时间:", item.appointmentTime)
+ 
+-                    item.remarks?.let {
+-                        if (it.isNotBlank()) DetailRow("备注:", it)
++                    if (!item.remarks.isNullOrBlank()) {
++                        DetailRow("备注:", item.remarks)
+                     }
+ 
++                    Divider(Modifier.padding(vertical = 8.dp))
+                     DetailRow("提交时间:", item.submissionDate)
+                 }
+             }

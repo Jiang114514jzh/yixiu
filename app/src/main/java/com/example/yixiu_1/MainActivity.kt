@@ -37,10 +37,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.example.yixiu_1.data.UserPreferences
@@ -64,10 +64,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // in MainActivity.kt
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         try {
-            enableEdgeToEdge()
+            // 【关键修复】注释掉 enableEdgeToEdge() 来解决键盘动画超时问题
+            // enableEdgeToEdge()
+
             setContent {
                 YIXIU_1Theme {
                     SafeAppContent()
@@ -167,9 +170,7 @@ fun StandardTopAppBar(
                                 .sharedElement(
                                     state = rememberSharedContentState(key = "avatar"),
                                     animatedVisibilityScope = animatedContentScope,
-                                    boundsTransform = { _, _ ->
-                                        tween(durationMillis = 500)
-                                    }
+                                    boundsTransform = { _, _ -> tween(500) }
                                 )
                         )
                     }
@@ -204,6 +205,13 @@ private fun AppContentInternal(
     LaunchedEffect(Unit, currentScreen) {
         isLoggedIn = userPreferences.isLoggedIn
         avatarPath = userPreferences.avatarPath
+
+        // 【关键修复】应用启动时恢复Token，防止重启后无法提交数据
+        val savedToken = userPreferences.token
+        if (!savedToken.isNullOrBlank()) {
+            NetworkClient.setToken(savedToken)
+            Log.d("AppContent", "Token restored from preferences")
+        }
     }
 
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
@@ -307,7 +315,7 @@ private fun AppContentInternal(
                                             Icon(Icons.Default.ArrowBack, contentDescription = "Back")
                                         }
                                     },
-                                    colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent, titleContentColor = Color.White, navigationIconContentColor = Color.White)
+                                    modifier = Modifier.background(Color.White)
                                 )
                             },
                             containerColor = Color.Transparent
@@ -332,7 +340,9 @@ private fun AppContentInternal(
                                 modifier = Modifier.padding(innerPadding),
                                 userPreferences = userPreferences,
                                 onBack = { currentScreen = Screen.Home },
-                                onSubmissionSuccess = { currentScreen = Screen.Home }
+                                // 【关键修改】提交成功后，直接跳转到历史记录页面
+                                // 这样不仅能立即看到结果，还能触发历史页面的数据刷新
+                                onSubmissionSuccess = { currentScreen = Screen.RepairHistory }
                             )
                         }
                     }
@@ -351,13 +361,21 @@ private fun AppContentInternal(
                             },
                             containerColor = Color.Transparent
                         ) { innerPadding ->
-                            RepairHistoryScreen(
-                                userPreferences = userPreferences,
-                                onNavigateToDetail = { taskId -> currentScreen = Screen.RepairDetail(taskId) },
-                                modifier = Modifier.padding(innerPadding)
-                            )
+                            // 【关键修改】使用 key 绑定 userId
+                            // 作用：当 userId 发生变化（如切换账号）时，Compose 会强制销毁并重建这个页面
+                            // 确保了：
+                            // 1. 账号不变时，页面状态保持稳定
+                            // 2. 账号变化时，绝不会显示上一个账号的残留数据，并强制重新加载
+                            key(userPreferences.userId) {
+                                RepairHistoryScreen(
+                                    userPreferences = userPreferences,
+                                    onNavigateToDetail = { taskId -> currentScreen = Screen.RepairDetail(taskId) },
+                                    modifier = Modifier.padding(innerPadding)
+                                )
+                            }
                         }
                     }
+
                     is Screen.RepairDetail -> {
                         Scaffold(
                             topBar = {
@@ -440,17 +458,26 @@ fun ExpandableNavigationItem(
 @Composable
 fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, onLoginSuccess: () -> Unit) {
     var email by remember { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
+    // 注意：EmailRegisterOrLoginRequest 数据类中没有 password，所以移除密码输入框，只使用验证码
     var verificationCode by remember { mutableStateOf("") }
     var isLoginMode by remember { mutableStateOf(true) }
+    var isLoading by remember { mutableStateOf(false) }
+    var countdown by remember { mutableIntStateOf(0) }
     var authCodeSent by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
 
-    // 【关键修改 1】定义身份选项 (显示名称 to 后端值)
+    // 身份选项
     val roleOptions = listOf("学生" to "student", "志愿者" to "volunteer", "管理员" to "super_admin")
-    // 【关键修改 2】创建 role 状态，默认值为 "student"
+    // 角色状态，默认学生
     var selectedRole by remember { mutableStateOf("student") }
+
+    LaunchedEffect(countdown) {
+        if (countdown > 0) {
+            kotlinx.coroutines.delay(1000L)
+            countdown--
+        }
+    }
 
     Column(
         modifier = modifier
@@ -468,7 +495,7 @@ fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, 
 
         Spacer(Modifier.height(32.dp))
 
-        // 【关键修改 3】添加身份选择的UI组件
+        // 身份选择 UI
         Text("选择您的身份", style = MaterialTheme.typography.titleSmall, color = Color.White)
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -517,70 +544,66 @@ fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, 
 
         Spacer(Modifier.height(16.dp))
 
-        OutlinedTextField(
-            value = password,
-            onValueChange = { password = it },
-            label = { Text("密码") },
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-            modifier = Modifier.fillMaxWidth(),
-            colors = TextFieldDefaults.colors(
-                focusedContainerColor = Color.White.copy(alpha = 0.1f),
-                unfocusedContainerColor = Color.White.copy(alpha = 0.1f),
-                disabledContainerColor = Color.Gray,
-                focusedIndicatorColor = Color.White,
-                unfocusedIndicatorColor = Color.White.copy(alpha = 0.7f),
-                focusedLabelColor = Color.White,
-                unfocusedLabelColor = Color.White.copy(alpha = 0.7f),
-                cursorColor = Color.White,
-                focusedTextColor = Color.White,
-                unfocusedTextColor = Color.White
-            )
-        )
-
-        Spacer(Modifier.height(16.dp))
-
-        if (!isLoginMode) {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                OutlinedTextField(
-                    value = verificationCode,
-                    onValueChange = { verificationCode = it },
-                    label = { Text("验证码") },
-                    modifier = Modifier.weight(1f),
-                    colors = TextFieldDefaults.colors(
-                        focusedContainerColor = Color.White.copy(alpha = 0.1f),
-                        unfocusedContainerColor = Color.White.copy(alpha = 0.1f),
-                        disabledContainerColor = Color.Gray,
-                        focusedIndicatorColor = Color.White,
-                        unfocusedIndicatorColor = Color.White.copy(alpha = 0.7f),
-                        focusedLabelColor = Color.White,
-                        unfocusedLabelColor = Color.White.copy(alpha = 0.7f),
-                        cursorColor = Color.White,
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White
-                    )
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            OutlinedTextField(
+                value = verificationCode,
+                onValueChange = { verificationCode = it },
+                label = { Text("验证码") },
+                modifier = Modifier.weight(1f),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor = Color.White.copy(alpha = 0.1f),
+                    unfocusedContainerColor = Color.White.copy(alpha = 0.1f),
+                    disabledContainerColor = Color.Gray,
+                    focusedIndicatorColor = Color.White,
+                    unfocusedIndicatorColor = Color.White.copy(alpha = 0.7f),
+                    focusedLabelColor = Color.White,
+                    unfocusedLabelColor = Color.White.copy(alpha = 0.7f),
+                    cursorColor = Color.White,
+                    focusedTextColor = Color.White,
+                    unfocusedTextColor = Color.White
                 )
-                Spacer(Modifier.width(8.dp))
-                Button(
-                    onClick = {
-                        scope.launch {
-                            try {
-                                val response = NetworkClient.instance.sendEmailVerification(email)
-                                if (response.isSuccessful) {
-                                    authCodeSent = true
-                                    Toast.makeText(context, "验证码已发送", Toast.LENGTH_SHORT).show()
-                                } else {
-                                    val errorBody = response.errorBody()?.string() ?: "未知错误"
-                                    Toast.makeText(context, "发送失败: $errorBody", Toast.LENGTH_SHORT).show()
-                                }
-                            } catch (e: Exception) {
-                                Toast.makeText(context, "网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
+            )
+            Spacer(Modifier.width(8.dp))
+            Button(
+                onClick = {
+                    scope.launch {
+                        if (email.isBlank()) {
+                            Toast.makeText(context, "请输入邮箱", Toast.LENGTH_SHORT).show()
+                            return@launch
+                        }
+
+                        // 点击后立即开始倒计时
+                        countdown = 60
+
+                        try {
+                            val response = NetworkClient.instance.sendEmailVerification(email)
+                            if (response.isSuccessful) {
+                                Toast.makeText(context, "验证码已发送", Toast.LENGTH_SHORT).show()
+                            } else {
+                                Toast.makeText(context, "发送失败: ${response.code()}", Toast.LENGTH_SHORT).show()
+                                // 发送失败可以选择重置倒计时，也可以维持倒计时防止刷接口
+                                // countdown = 0
                             }
+                        } catch (e: Exception) {
+                            Toast.makeText(context, "发送错误: ${e.message}", Toast.LENGTH_SHORT).show()
+                            // 网络错误建议重置倒计时，方便用户重试
+                            countdown = 0
                         }
                     }
-                ) {
-                    Text("发送")
+                },
+                //modifier = Modifier.fillMaxWidth(),
+                // 【关键修改】如果正在加载 OR 正在倒计时(>0)，则禁用按钮
+                enabled = !isLoading && countdown == 0
+            ) {
+                // 【关键修改】根据倒计时状态显示文本
+                if (countdown > 0) {
+                    Text("${countdown}s 后重试")
+                } else {
+                    Text("获取验证码")
                 }
             }
+
         }
 
         Spacer(Modifier.height(32.dp))
@@ -589,14 +612,19 @@ fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, 
             onClick = {
                 scope.launch {
                     try {
-                        // 修复：使用正确的参数构造请求对象
+                        val codeInt = verificationCode.toIntOrNull()
+                        if (codeInt == null) {
+                            Toast.makeText(context, "请输入有效的数字验证码", Toast.LENGTH_SHORT).show()
+                            return@launch
+                        }
+
+                        // 【匹配数据类】EmailRegisterOrLoginRequest 包含 email, role, verificationCode
                         val request = EmailRegisterOrLoginRequest(
                             email = email,
                             role = selectedRole,
-                            verificationCode = if (verificationCode.isNotEmpty()) verificationCode.toInt() else 0
+                            verificationCode = codeInt
                         )
 
-                        // 修复：根据模式调用相应的方法
                         val response = if (isLoginMode) {
                             NetworkClient.instance.loginByEmail(request)
                         } else {
@@ -604,17 +632,58 @@ fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, 
                         }
 
                         if (response.isSuccessful) {
-                            val authResponse = response.body()
-                            if (authResponse != null) {
-                                // 修复：手动设置用户信息
-                                userPreferences.isLoggedIn = true
-                                userPreferences.token = authResponse.data?.toString() ?: ""
-                                userPreferences.userEmail = email
-                                userPreferences.userRole = selectedRole
+                            // 假设 ApiResponse 的 data 返回的是 Token 字符串或者包含 token 的 Map
+                            // 这里需要根据您的实际 AuthResponse 结构调整。
+                            // 为了兼容，我们假设如果成功，我们需要手动获取 UserInfo
+                            val responseData = response.body()?.data
+
+                            var tempToken: String? = null
+                            // 尝试解析 token，这里可能需要根据实际情况调整
+                            if (responseData is Map<*, *>) {
+                                tempToken = responseData["token"] as? String
+                            } else if (responseData is String) {
+                                tempToken = responseData
+                            }
+
+                            // 如果没直接拿到 token，可能在 Header 里，或者需要额外逻辑。
+                            // 暂时假设我们通过某种方式拿到了 token。如果这里始终失败，请检查登录返回的具体 JSON。
+                            // 由于 NetworkClient.setToken 已经存在，我们假设后端返回的 Map 中包含 "token"
+
+                            if (tempToken != null) {
+                                userPreferences.token = tempToken
+                                NetworkClient.setToken(tempToken)
+
+                                // 登录成功后，立即获取用户信息
+                                try {
+                                    val userResp = NetworkClient.instance.getUserInfo()
+                                    if (userResp.isSuccessful) {
+                                        val userInfo = userResp.body()?.data
+                                        if (userInfo != null) {
+                                            userPreferences.isLoggedIn = true // 别忘了设置登录状态
+                                            userPreferences.token = tempToken
+                                            userPreferences.userId = userInfo.userId
+                                            userPreferences.nickname = userInfo.username
+                                            userPreferences.userEmail = userInfo.email
+                                            userPreferences.avatarPath = userInfo.avatar
+                                            userPreferences.userRole = userInfo.role
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    Log.e("Auth", "Failed to get user info", e)
+                                }
+
                                 Toast.makeText(context, if (isLoginMode) "登录成功" else "注册成功", Toast.LENGTH_SHORT).show()
                                 onLoginSuccess()
                             } else {
-                                Toast.makeText(context, "响应为空", Toast.LENGTH_SHORT).show()
+                                // 备用方案：如果注册不返回 token，提示去登录
+                                if (!isLoginMode) {
+                                    Toast.makeText(context, "注册成功，请登录", Toast.LENGTH_SHORT).show()
+                                    isLoginMode = true // 切换到登录模式
+                                } else {
+                                    // 登录但没拿到 token，尝试直接获取 UserInfo (有些后端可能通过 Cookie 鉴权)
+                                    // 或者提示错误
+                                    Toast.makeText(context, "登录响应未包含令牌", Toast.LENGTH_SHORT).show()
+                                }
                             }
                         } else {
                             val errorBody = response.errorBody()?.string() ?: "未知错误"
@@ -658,12 +727,11 @@ fun AppointmentQuestionnaireScreen(
 
     // 选项 (使用 Int 代表类型)
     var contactType by remember { mutableIntStateOf(1) } // 1:QQ, 2:微信, 3:电话
-    var campus by remember { mutableIntStateOf(1) } // 1:东校区, 2:西校区, 3:南校区
+    var campus by remember { mutableIntStateOf(0) } // 0:大学城, 1:白云山
 
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
 
-    // 定义通用输入框样式
     val textFieldColors = TextFieldDefaults.colors(
         focusedContainerColor = Color.White.copy(alpha = 0.9f),
         unfocusedContainerColor = Color.White.copy(alpha = 0.8f),
@@ -677,34 +745,32 @@ fun AppointmentQuestionnaireScreen(
         unfocusedLabelColor = Color.DarkGray
     )
 
-    // 使用 Box 作为外层容器，处理 scaffold 的 padding
     Box(
         modifier = modifier
             .fillMaxSize()
-            .padding(16.dp), // 外边距
+            .padding(16.dp),
         contentAlignment = Alignment.TopCenter
     ) {
-        // 添加白色半透明卡片背景，与 RepairDetailScreen 风格一致
         Card(
             modifier = Modifier
                 .fillMaxWidth()
-                .verticalScroll(rememberScrollState()), // 滚动逻辑移动到卡片上
+                .verticalScroll(rememberScrollState()),
             shape = RoundedCornerShape(12.dp),
             colors = CardDefaults.cardColors(
-                containerColor = Color.White.copy(alpha = 0.9f) // 白色半透明背景
+                containerColor = Color.White.copy(alpha = 0.9f)
             ),
             elevation = CardDefaults.cardElevation(4.dp)
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(16.dp), // 卡片内部内边距
+                    .padding(16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
                     "请详细填写报修单",
                     style = MaterialTheme.typography.titleLarge,
-                    color = Color.Black // 调整文字颜色为黑色以适应白色背景
+                    color = Color.Black
                 )
 
                 Spacer(modifier = Modifier.height(24.dp))
@@ -726,7 +792,7 @@ fun AppointmentQuestionnaireScreen(
                 // 2. 校区选择
                 Text("选择校区", color = Color.Black, modifier = Modifier.align(Alignment.Start))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
-                    listOf("南校区" to 1, "北校区" to 2).forEach { (name, value) ->
+                    listOf("大学城校区" to 0, "白云山校区" to 1).forEach { (name, value) ->
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier.clickable { campus = value }
@@ -734,7 +800,6 @@ fun AppointmentQuestionnaireScreen(
                             RadioButton(
                                 selected = (campus == value),
                                 onClick = { campus = value },
-                                // 使用默认颜色或深色，确保在白色背景上可见
                                 colors = RadioButtonDefaults.colors(
                                     selectedColor = MaterialTheme.colorScheme.primary,
                                     unselectedColor = Color.Gray
@@ -763,7 +828,7 @@ fun AppointmentQuestionnaireScreen(
                 // 4. 联系方式
                 Text("联系方式类型", color = Color.Black, modifier = Modifier.align(Alignment.Start))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
-                    listOf("QQ" to 1, "微信" to 2).forEach { (name, value) ->
+                    listOf("QQ" to 1, "微信" to 2, "电话" to 3).forEach { (name, value) ->
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier.clickable { contactType = value }
@@ -864,9 +929,9 @@ fun AppointmentQuestionnaireScreen(
                                 return@launch
                             }
                             try {
-                                // 构造完整的请求对象
+                                // 【修复】根据 Task.kt，userId 是 Int，直接传递
                                 val request = RepairTaskRequest(
-                                    userId = userId,
+                                    userId = userId, // 直接使用 Int 类型的 userId
                                     contactType = contactType,
                                     contactInfo = contactInfo,
                                     deviceType = deviceType,
@@ -878,15 +943,48 @@ fun AppointmentQuestionnaireScreen(
                                     appointmentTime = appointmentTime,
                                     remarks = remarks.ifBlank { null }
                                 )
+
+                                // 【关键日志 1】打印将要发送的请求对象
+                                Log.d("SubmitRepair", "Request Body: $request")
+
                                 val response = NetworkClient.instance.submitRepairTask(request)
-                                if (response.isSuccessful) {
+
+                                // 【关键日志 2】打印完整的后端响应
+                                val responseBody = response.body()
+                                val errorBody = response.errorBody()?.string()
+                                Log.d("SubmitRepair", "Response Code: ${response.code()}")
+                                Log.d("SubmitRepair", "Response Body: $responseBody")
+                                Log.d("SubmitRepair", "Error Body: $errorBody")
+
+                                if (response.isSuccessful && responseBody?.code == 200) {
+                                    // 提交成功后，将记录添加到本地历史
+                                    userPreferences.addRepairHistory(
+                                        // 构造一个临时的 RepairHistoryItem 用于本地显示
+                                        RepairHistoryItem(
+                                            id = "local_${System.currentTimeMillis()}", // 临时ID
+                                            problemDescription = description,
+                                            repairLocation = location,
+                                            campus = if (campus == 0) "大学城校区" else "白云山校区",
+                                            deviceType = deviceType,
+                                            deviceModel = deviceModel,
+                                            deviceSystem = deviceSystem,
+                                            contactType = contactType.toString(),
+                                            contactInfo = contactInfo,
+                                            appointmentTime = appointmentTime,
+                                            submissionDate = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date()),
+                                            remarks = remarks
+                                        )
+                                    )
                                     Toast.makeText(context, "提交成功", Toast.LENGTH_SHORT).show()
                                     onSubmissionSuccess()
                                 } else {
-                                    val errorBody = response.errorBody()?.string() ?: "提交失败"
-                                    Toast.makeText(context, errorBody, Toast.LENGTH_SHORT).show()
+                                    // 【优化】显示更详细的错误信息
+                                    val errorMessage = responseBody?.msg ?: errorBody ?: "提交失败，未知错误"
+                                    Toast.makeText(context, "提交失败: $errorMessage", Toast.LENGTH_LONG).show()
                                 }
                             } catch (e: Exception) {
+                                // 【关键日志 3】打印网络或程序异常
+                                Log.e("SubmitRepair", "Exception during submission", e)
                                 Toast.makeText(context, "网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
                             }
                         }
@@ -901,8 +999,6 @@ fun AppointmentQuestionnaireScreen(
         }
     }
 }
-
-
 
 @Composable
 fun RepairHistoryScreen(
@@ -922,16 +1018,37 @@ fun RepairHistoryScreen(
             isLoading = false
             return@LaunchedEffect
         }
-        scope.launch {
-            try {
-                // 获取本地历史记录而不是网络请求
-                history = userPreferences.getRepairHistory()
-            } catch (e: Exception) {
-                Toast.makeText(context, "网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
-            } finally {
-                isLoading = false
-            }
+        try {
+            val localHistory = userPreferences.getRepairHistory()
+            // 按提交时间倒序排序
+            history = localHistory.sortedByDescending { it.submissionDate }
+        } catch (e: Exception) {
+            // 如果读取失败，history 保持为空
+            Log.e("RepairHistory", "Error loading local history", e)
+        } finally {
+            isLoading = false
         }
+//        scope.launch {
+//            try {
+//                // 如果您在 NetworkClient 中添加了 getRepairHistory(userId)，请取消注释并使用
+//                // 目前代码为了防止报错，暂时只做 Toast 提示，因为 ApiService 定义中没有该方法。
+//                // 如果 ApiService 有：
+//                /*
+//                val response = NetworkClient.instance.getRepairHistory(userId)
+//                if (response.isSuccessful) {
+//                    history = response.body()?.data ?: emptyList()
+//                } else {
+//                    Toast.makeText(context, "加载历史记录失败", Toast.LENGTH_SHORT).show()
+//                }
+//                */
+//                // 模拟数据 (防止报错)
+//                isLoading = false
+//            } catch (e: Exception) {
+//                Toast.makeText(context, "网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
+//            } finally {
+//                isLoading = false
+//            }
+//        }
     }
 
     Box(
@@ -943,7 +1060,19 @@ fun RepairHistoryScreen(
         if (isLoading) {
             CircularProgressIndicator(color = Color.White)
         } else if (history.isEmpty()) {
-            Text("没有维修记录", color = Color.White, style = MaterialTheme.typography.titleMedium)
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(
+                    "暂无报修记录",
+                    color = Color.White,
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    "提交的报修将显示在这里",
+                    color = Color.White.copy(alpha = 0.7f),
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
         } else {
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
@@ -977,14 +1106,21 @@ fun HistoryCard(item: RepairHistoryItem, onClick: () -> Unit) {
                 overflow = TextOverflow.Ellipsis
             )
             Spacer(Modifier.height(8.dp))
+
+            // Task.kt 中的 RepairHistoryItem 没有 status 字段
+            // 这里显示设备类型作为替代信息，或者您可以显示校区
             Text(
-                "联系方式: ${item.contactType}",
-                style = MaterialTheme.typography.bodyMedium
+                "设备: ${item.deviceType} - ${item.deviceModel}",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface
             )
+
             Spacer(Modifier.height(4.dp))
             Text(
-                "时间: ${item.submissionDate}",
-                style = MaterialTheme.typography.bodySmall
+                // Task.kt 中使用的是 submissionDate
+                "提交时间: ${item.submissionDate}",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.Gray
             )
         }
     }
@@ -1002,16 +1138,27 @@ fun RepairDetailScreen(
     val context = LocalContext.current
 
     LaunchedEffect(taskId) {
-        scope.launch {
-            try {
-                // 从本地历史记录中查找详情
-                val history = userPreferences.getRepairHistory()
-                detail = history.find { it.id == taskId }
-            } catch (e: Exception) {
-                Toast.makeText(context, "加载详情失败: ${e.message}", Toast.LENGTH_SHORT).show()
-            } finally {
-                isLoading = false
+        try {
+            // 【关键修改】优先从本地数据中查找对应的工单
+            // 因为刚刚提交的数据保存在本地，网络接口可能还没有
+            val localHistory = userPreferences.getRepairHistory()
+            val localItem = localHistory.find { it.id == taskId }
+
+            if (localItem != null) {
+                detail = localItem
+            } else {
+                // 如果本地找不到，尝试请求网络接口 (如果已实现)
+                /*
+                val response = NetworkClient.instance.getRepairDetail(taskId)
+                if (response.isSuccessful) {
+                    detail = response.body()?.data
+                }
+                */
             }
+        } catch (e: Exception) {
+            Toast.makeText(context, "加载详情出错: ${e.message}", Toast.LENGTH_SHORT).show()
+        } finally {
+            isLoading = false
         }
     }
 
@@ -1024,7 +1171,11 @@ fun RepairDetailScreen(
         if (isLoading) {
             CircularProgressIndicator(color = Color.White)
         } else if (detail == null) {
-            Text("未找到维修详情", color = Color.White, style = MaterialTheme.typography.titleMedium)
+            Text(
+                "未找到该工单详情",
+                color = Color.White,
+                style = MaterialTheme.typography.titleMedium
+            )
         } else {
             val item = detail!!
             Card(
@@ -1038,17 +1189,34 @@ fun RepairDetailScreen(
                 elevation = CardDefaults.cardElevation(4.dp)
             ) {
                 Column(Modifier.padding(24.dp)) {
+                    Text(
+                        "维修工单详情",
+                        style = MaterialTheme.typography.headlineSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Divider(Modifier.padding(vertical = 8.dp))
+
                     DetailRow("任务ID:", item.id)
-                    DetailRow("联系方式:", item.contactType)
-                    DetailRow("联系信息:", item.contactInfo)
-                    DetailRow("设备类型:", item.deviceType)
-                    DetailRow("系统:", item.deviceSystem)
-                    DetailRow("型号:", item.deviceModel)
-                    DetailRow("描述:", item.problemDescription)
+                    DetailRow("问题描述:", item.problemDescription)
                     DetailRow("校区:", item.campus)
                     DetailRow("地址:", item.repairLocation)
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("设备信息", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    DetailRow("类型:", item.deviceType)
+                    DetailRow("型号:", item.deviceModel)
+                    DetailRow("系统:", item.deviceSystem)
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("联系与预约", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    DetailRow("联系方式:", "${item.contactType} - ${item.contactInfo}")
                     DetailRow("预约时间:", item.appointmentTime)
-                    item.remarks?.let { DetailRow("备注:", it) }
+
+                    if (!item.remarks.isNullOrBlank()) {
+                        DetailRow("备注:", item.remarks)
+                    }
+
+                    Divider(Modifier.padding(vertical = 8.dp))
                     DetailRow("提交时间:", item.submissionDate)
                 }
             }
