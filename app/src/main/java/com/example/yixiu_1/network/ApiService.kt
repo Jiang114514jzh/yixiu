@@ -16,6 +16,27 @@ import retrofit2.http.Part
 import retrofit2.http.Query
 import java.util.concurrent.TimeUnit
 
+data class NotifyItem(
+    val notifyIdKotlin: Int,
+    val senderId: Int,
+    val receiverId: Int,
+    val title: String,
+    val content: String,
+    val link: String?,
+    val type: String, // "SYSTEM", "BROADCAST", "USER"
+    val isRead: Int, // 0 for unreadKotlin, 1 for read
+    val senderUsername: String?,
+    val senderAvatar: String?,
+    val createTime: String
+)
+
+data class VolunteerRegisterRequest(
+    val email: String,
+    val role: String,
+    val verificationCode: Int,
+    val inviteCode: Int
+)
+
 //============ 接口定义 ============
 interface ApiService {
     // --- 登录注册相关接口 ---
@@ -38,6 +59,11 @@ interface ApiService {
     @Multipart
     @PUT("/api/v1/users/avatar")
     suspend fun uploadAvatar(@Part avatar: MultipartBody.Part): Response<ApiResponse<Any>>
+
+    @GET("/api/v1/notify/list")
+    suspend fun getNotifications(): Response<ApiResponse<List<NotifyItem>>>
+    @POST("/api/v1/volunteer/registerByEmail")
+    suspend fun registerVolunteer(@Body body: VolunteerRegisterRequest): Response<ApiResponse<Any>>
 }
 
 //============ Retrofit 客户端实例 ============

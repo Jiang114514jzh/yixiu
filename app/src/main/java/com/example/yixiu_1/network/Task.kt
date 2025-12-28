@@ -19,10 +19,10 @@ data class RepairTaskRequest(
     val campus: Int, // 0 代表大学城校区, 1 代表白云山校区
     val repairLocation: String,
 
-    @SerializedName("AppointmentTime")
+    @SerializedName("appointmentTime")
     val appointmentTime: String,
 
-    @SerializedName("Remarks")
+    @SerializedName("remarks")
     val remarks: String?
 )
 

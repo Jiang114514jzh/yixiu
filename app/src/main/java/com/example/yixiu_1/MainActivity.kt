@@ -11,6 +11,7 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -43,6 +44,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.compose.material.icons.filled.Email
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
@@ -53,6 +55,7 @@ import com.example.yixiu_1.network.RepairHistoryItem
 import com.example.yixiu_1.network.RepairTaskRequest
 import com.example.yixiu_1.ui.ProfileScreen
 import com.example.yixiu_1.ui.theme.YIXIU_1Theme
+import com.example.yixiu_1.network.NotifyItem
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import java.io.File
@@ -98,6 +101,7 @@ sealed class Screen {
     object AppointmentQuestionnaire : Screen()
     object RepairHistory : Screen()
     data class RepairDetail(val taskId: String) : Screen()
+    object MessageCenter : Screen()
 }
 
 // ===================== 3. 核心导航与动画逻辑 =====================
@@ -159,7 +163,9 @@ fun AvatarImage(
                     )
                     .build(),
                 contentDescription = "Avatar",
-                modifier = Modifier.matchParentSize().clip(CircleShape),
+                modifier = Modifier
+                    .matchParentSize()
+                    .clip(CircleShape),
                 contentScale = ContentScale.Crop
             )
         }
@@ -183,6 +189,8 @@ fun StandardTopAppBar(
     scope: CoroutineScope,
     isLoggedIn: Boolean,
     avatarPath: String?,
+    hasUnreadMessages: Boolean = false, // 【新增参数】是否有未读消息
+    onMessageClick: () -> Unit = {},    // 【新增参数】点击消息图标的回调
     sharedTransitionScope: SharedTransitionScope,
     animatedContentScope: AnimatedContentScope,
     onAvatarClick: () -> Unit
@@ -203,6 +211,40 @@ fun StandardTopAppBar(
                 )
             },
             actions = {
+                // 【新增】消息中心入口
+                // 只有登录后才显示消息入口，或者你可以选择始终显示但点击提示登录
+                if (isLoggedIn) {
+                    Box(
+                        modifier = Modifier
+                            .padding(end = 12.dp) // 与头像保持一点距离
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .background(Color.Transparent) // 或者稍微灰一点的背景 Color(0xFFF5F5F5)
+                            .clickable(onClick = onMessageClick),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        // 信封图标
+                        Icon(
+                            imageVector = Icons.Default.Email, // 需要 import androidx.compose.material.icons.filled.Email
+                            contentDescription = "消息中心",
+                            tint = Color.Gray,
+                            modifier = Modifier.size(24.dp)
+                        )
+
+                        // 红点提示
+                        if (hasUnreadMessages) {
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(top = 8.dp, end = 8.dp) // 调整红点位置
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(Color.Red)
+                            )
+                        }
+                    }
+                }
+
                 with(sharedTransitionScope) {
                     IconButton(onClick = onAvatarClick) {
                         AvatarImage(
@@ -221,6 +263,7 @@ fun StandardTopAppBar(
         )
     }
 }
+
 
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalSharedTransitionApi::class)
@@ -243,7 +286,24 @@ private fun AppContentInternal(
     var currentScreen by remember { mutableStateOf<Screen>(Screen.Home) }
     var isLoggedIn by remember { mutableStateOf(false) }
     var avatarPath by remember { mutableStateOf<String?>(null) }
-
+    var hasUnread by remember { mutableStateOf(false) }
+    LaunchedEffect(isLoggedIn, currentScreen) {
+        if (isLoggedIn) {
+            try {
+                // 调用获取消息列表接口，检查是否有 isRead == 0 的消息
+                // 注意：这会拉取所有消息，如果消息量大建议后端提供专门的 /notify/unread-count 接口
+                val response = NetworkClient.instance.getNotifications()
+                if (response.isSuccessful && response.body()?.code == 200) {
+                    val list = response.body()?.data ?: emptyList()
+                    hasUnread = list.any { it.isRead == 0 }
+                }
+            } catch (e: Exception) {
+                // 忽略错误，仅仅是不显示红点
+            }
+        } else {
+            hasUnread = false
+        }
+    }
     LaunchedEffect(Unit, currentScreen) {
         isLoggedIn = userPreferences.isLoggedIn
         avatarPath = userPreferences.avatarPath
@@ -289,6 +349,11 @@ private fun AppContentInternal(
                         selected = currentScreen == Screen.Home,
                         onClick = { scope.launch { drawerState.close() }; currentScreen = Screen.Home }
                     )
+                    NavigationDrawerItem(
+                        label = { Text("消息中心") },
+                        selected = currentScreen == Screen.MessageCenter,
+                        onClick = { scope.launch { drawerState.close() }; currentScreen = Screen.MessageCenter }
+                    )
                     ExpandableNavigationItem(
                         label = "义修服务",
                         isExpanded = isServiceExpanded,
@@ -320,6 +385,8 @@ private fun AppContentInternal(
                                     drawerState = drawerState,scope = scope,
                                     isLoggedIn = isLoggedIn,
                                     avatarPath = avatarPath,
+                                    hasUnreadMessages = hasUnread,
+                                    onMessageClick = { currentScreen = Screen.MessageCenter },
                                     sharedTransitionScope = sharedTransitionScope,
                                     animatedContentScope = animatedContentScope,
                                     onAvatarClick = { currentScreen = Screen.Profile }
@@ -334,8 +401,6 @@ private fun AppContentInternal(
                                     .fillMaxSize()
                             ) {
                                 // 计算模糊半径，复用之前定义的 blurRadius 逻辑
-                                // 注意：这里需要确保能访问到外层的 blurRadius 变量。
-                                // 如果访问不到，可以直接在这里重新计算：
                                 val cardBlurRadius by animateDpAsState(
                                     targetValue = if (drawerState.isOpen) 10.dp else 0.dp,
                                     animationSpec = tween(300), label = "cardBlur"
@@ -352,8 +417,6 @@ private fun AppContentInternal(
                                 Card(
                                     modifier = cardModifier
                                         .align(Alignment.TopCenter) // 先顶部居中
-                                        // 使用 padding 来模拟 61.8% 的位置 (黄金分割点)
-                                        // fillMaxHeight(0.618f) 会让它顶部的 spacer 占位，或者直接用 BiasAlignment
                                         .padding(top = (screenHeight * 0.1).dp)
                                         .padding(horizontal = 32.dp), // 水平边距
                                     colors = CardDefaults.cardColors(
@@ -390,20 +453,33 @@ private fun AppContentInternal(
                         )
                     }
                     is Screen.Login -> {
-                        Scaffold(
-                            topBar = {
-                                TopAppBar(
-                                    title = { Text("登录") },
-                                    navigationIcon = {
-                                        IconButton(onClick = { currentScreen = Screen.Home }) {
-                                            Icon(Icons.Default.ArrowBack, contentDescription = "Back")
-                                        }
-                                    },
-                                    modifier = Modifier.background(Color.White)
+                        // 【修改】移除 Scaffold，让 AuthScreen 直接显示在模糊背景之上
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            // 让 AuthScreen 填充整个屏幕，并处理状态栏/导航栏 padding
+                            AuthScreen(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .statusBarsPadding()
+                                    .navigationBarsPadding(),
+                                userPreferences = userPreferences,
+                                onLoginSuccess = { currentScreen = Screen.Home }
+                            )
+
+                            // 手动添加返回按钮
+                            IconButton(
+                                onClick = { currentScreen = Screen.Home },
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .statusBarsPadding()
+                                    .padding(start = 16.dp, top = 16.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.ArrowBack, // 【修复】修正参数名
+                                    contentDescription = "返回",
+                                    tint = Color.White // 在深色模糊背景上使用白色图标
                                 )
-                            },
-                            containerColor = Color.Transparent
-                        ) { p -> AuthScreen(Modifier.padding(p), userPreferences) { currentScreen = Screen.Home } }
+                            }
+                        }
                     }
                     Screen.AppointmentQuestionnaire -> {
                         Scaffold(
@@ -424,8 +500,6 @@ private fun AppContentInternal(
                                 modifier = Modifier.padding(innerPadding),
                                 userPreferences = userPreferences,
                                 onBack = { currentScreen = Screen.Home },
-                                // 【关键修改】提交成功后，直接跳转到历史记录页面
-                                // 这样不仅能立即看到结果，还能触发历史页面的数据刷新
                                 onSubmissionSuccess = { currentScreen = Screen.RepairHistory }
                             )
                         }
@@ -445,11 +519,6 @@ private fun AppContentInternal(
                             },
                             containerColor = Color.Transparent
                         ) { innerPadding ->
-                            // 【关键修改】使用 key 绑定 userId
-                            // 作用：当 userId 发生变化（如切换账号）时，Compose 会强制销毁并重建这个页面
-                            // 确保了：
-                            // 1. 账号不变时，页面状态保持稳定
-                            // 2. 账号变化时，绝不会显示上一个账号的残留数据，并强制重新加载
                             key(userPreferences.userId) {
                                 RepairHistoryScreen(
                                     userPreferences = userPreferences,
@@ -459,7 +528,6 @@ private fun AppContentInternal(
                             }
                         }
                     }
-
                     is Screen.RepairDetail -> {
                         Scaffold(
                             topBar = {
@@ -482,7 +550,29 @@ private fun AppContentInternal(
                             )
                         }
                     }
+                    is Screen.MessageCenter -> {
+                        Scaffold(
+                            topBar = {
+                                TopAppBar(
+                                    title = { Text("消息中心") },
+                                    navigationIcon = {
+                                        IconButton(onClick = { currentScreen = Screen.Home }) {
+                                            Icon(Icons.Default.ArrowBack, "Back")
+                                        }
+                                    },
+                                    modifier = Modifier.background(Color.White)
+                                )
+                            },
+                            containerColor = Color.Transparent
+                        ) { innerPadding ->
+                            MessageCenterScreen(
+                                modifier = Modifier.padding(innerPadding),
+                                userPreferences = userPreferences
+                            )
+                        }
+                    }
                 }
+
             }
         }
 
@@ -544,6 +634,8 @@ fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, 
     val context = LocalContext.current
     var email by remember { mutableStateOf("") }
     var verificationCode by remember { mutableStateOf("") }
+    // 【关键变量】邀请码状态
+    var inviteCode by remember { mutableStateOf("") }
     var isLoginMode by remember { mutableStateOf(true) }
     var isLoading by remember { mutableStateOf(false) }
     var countdown by remember { mutableIntStateOf(0) }
@@ -561,64 +653,72 @@ fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, 
 
     Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Surface(
-            modifier = Modifier.fillMaxWidth(0.9f).wrapContentHeight(),
+            modifier = Modifier
+                .fillMaxWidth(0.9f)
+                .wrapContentHeight(),
             shape = RoundedCornerShape(16.dp),
-            color = Color.Black.copy(alpha = 0.6f)
+            color = Color.White.copy(alpha = 0.8f)
         ) {
             Column(
-                modifier = Modifier.padding(24.dp).verticalScroll(rememberScrollState()),
+                modifier = Modifier
+                    .padding(24.dp)
+                    .verticalScroll(rememberScrollState()),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center
             ) {
-                Text(if (isLoginMode) "登录" else "注册", style = MaterialTheme.typography.headlineMedium, color = Color.White)
+                Text(if (isLoginMode) "登录" else "注册", style = MaterialTheme.typography.headlineMedium, color = Color.Black)
                 Spacer(Modifier.height(24.dp))
 
-                Text("选择您的身份", style = MaterialTheme.typography.titleSmall, color = Color.White)
+                Text("选择您的身份", style = MaterialTheme.typography.titleSmall, color = Color.Black)
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
                     roleOptions.forEach { (displayName, roleValue) ->
-                        Row(modifier = Modifier.clickable { selectedRole = roleValue }.padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Row(modifier = Modifier
+                            .clickable { selectedRole = roleValue }
+                            .padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                             RadioButton(
                                 selected = (selectedRole == roleValue),
                                 onClick = { selectedRole = roleValue },
-                                colors = RadioButtonDefaults.colors(selectedColor = Color.White, unselectedColor = Color.White.copy(alpha = 0.7f))
+                                colors = RadioButtonDefaults.colors(selectedColor = Color.Black, unselectedColor = Color.Black.copy(alpha = 0.7f))
                             )
-                            Text(text = displayName, color = Color.White, style = MaterialTheme.typography.bodySmall)
+                            Text(text = displayName, color = Color.Black, style = MaterialTheme.typography.bodySmall)
                         }
                     }
                 }
                 Spacer(Modifier.height(16.dp))
 
+                // 1. 邮箱输入框 (始终显示)
                 OutlinedTextField(
                     value = email,
                     onValueChange = { email = it },
-                    label = { Text("邮箱", color = Color.White.copy(alpha = 0.8f)) },
+                    label = { Text("邮箱", color = Color.Black.copy(alpha = 0.8f)) },
                     modifier = Modifier.fillMaxWidth(),
                     colors = TextFieldDefaults.colors(
                         focusedContainerColor = Color.Transparent,
                         unfocusedContainerColor = Color.Transparent,
-                        focusedIndicatorColor = Color.White,
-                        unfocusedIndicatorColor = Color.White.copy(alpha = 0.5f),
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White
+                        focusedIndicatorColor = Color.Black,
+                        unfocusedIndicatorColor = Color.Black.copy(alpha = 0.5f),
+                        focusedTextColor = Color.Black,
+                        unfocusedTextColor = Color.Black
                     ),
                     singleLine = true
                 )
                 Spacer(Modifier.height(16.dp))
 
+                // 2. 验证码输入框 (始终显示)
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                     OutlinedTextField(
                         value = verificationCode,
                         onValueChange = { verificationCode = it },
-                        label = { Text("验证码", color = Color.White.copy(alpha = 0.8f)) },
+                        label = { Text("验证码", color = Color.Black.copy(alpha = 0.8f)) },
                         modifier = Modifier.weight(1f),
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         colors = TextFieldDefaults.colors(
                             focusedContainerColor = Color.Transparent,
                             unfocusedContainerColor = Color.Transparent,
-                            focusedIndicatorColor = Color.White,
-                            unfocusedIndicatorColor = Color.White.copy(alpha = 0.5f),
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
+                            focusedIndicatorColor = Color.Black,
+                            unfocusedIndicatorColor = Color.Black.copy(alpha = 0.5f),
+                            focusedTextColor = Color.Black,
+                            unfocusedTextColor = Color.Black
                         ),
                         singleLine = true
                     )
@@ -645,56 +745,97 @@ fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, 
                     ) { Text(if (countdown > 0) "${countdown}s" else "获取") }
                 }
 
+                // 3. 邀请码输入框 (仅在注册且选择志愿者时显示)
+                // 【修复】将此部分移出验证码的 Row，放在下方单独显示
+                AnimatedVisibility(visible = !isLoginMode && selectedRole == "volunteer") {
+                    Column {
+                        Spacer(Modifier.height(16.dp))
+                        OutlinedTextField(
+                            value = inviteCode,
+                            onValueChange = { inviteCode = it },
+                            label = { Text("志愿者邀请码", color = Color.Black.copy(alpha = 0.8f)) },
+                            modifier = Modifier.fillMaxWidth(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            colors = TextFieldDefaults.colors(
+                                focusedContainerColor = Color.Transparent,
+                                unfocusedContainerColor = Color.Transparent,
+                                focusedIndicatorColor = Color.Black,
+                                unfocusedIndicatorColor = Color.Black.copy(alpha = 0.5f),
+                                focusedTextColor = Color.Black,
+                                unfocusedTextColor = Color.Black
+                            ),
+                            singleLine = true
+                        )
+                    }
+                }
+
                 Spacer(Modifier.height(24.dp))
+
+                // 登录/注册按钮
                 Button(
                     onClick = {
                         scope.launch {
                             isLoading = true
                             try {
-                                val codeInt = verificationCode.toIntOrNull() ?: 0
-                                // 【修复】这里将 authCode 改为 code，匹配常见的数据类定义
-                                val request = EmailRegisterOrLoginRequest(email = email, role = selectedRole, verificationCode = codeInt)
-                                val resp = if (isLoginMode) NetworkClient.instance.loginByEmail(request) else NetworkClient.instance.registerByEmail(request)
-                                val token = (resp.body()?.data as? String) ?: (resp.body()?.data as? Map<*, *>)?.get("token") as? String
+                                // 逻辑分支：志愿者注册 vs 普通注册/登录
+                                if (!isLoginMode && selectedRole == "volunteer") {
+                                    // --- 志愿者注册逻辑 ---
+                                    if (inviteCode.isBlank()) {
+                                        Toast.makeText(context, "请输入志愿者邀请码", Toast.LENGTH_SHORT).show()
+                                        isLoading = false
+                                        return@launch
+                                    }
 
-                                if (token != null) {
-                                    userPreferences.token = token
-                                    NetworkClient.setToken(token)
-                                    userPreferences.isLoggedIn = true
+                                    // 确保 verificationCode 也有值
+                                    val vCodeInt = verificationCode.toIntOrNull()
+                                    if (vCodeInt == null) {
+                                        Toast.makeText(context, "请输入有效的验证码", Toast.LENGTH_SHORT).show()
+                                        isLoading = false
+                                        return@launch
+                                    }
 
-                                    // 【头像逻辑】登录后获取用户信息，并使用其中的 avatar 字段更新头像
-                                    try {
-                                        val uResp = NetworkClient.instance.getUserInfo()
-                                        // 假设 getUserInfo 返回的是 ApiResponse<UserInfo>
-                                        val userInfo = uResp.body()?.data
-                                        if (userInfo != null) {
-                                            // 注意：这里需要根据你实际的 UserInfo 类结构进行取值
-                                            // 如果是 Any 类型需要强转，如果是泛型则直接使用
-                                            // 这里假设 userInfo 对象中有 avatar 属性
-                                            // 且 userId 是 String 类型 (如果不是请转 .toString())
-                                            // userPreferences.userId = userInfo.userId.toString()
-                                            // ...
+                                    val request = com.example.yixiu_1.network.VolunteerRegisterRequest(
+                                        email = email,
+                                        role = selectedRole,
+                                        verificationCode = vCodeInt,
+                                        inviteCode = inviteCode.toIntOrNull() ?: 0
+                                    )
+                                    val resp = NetworkClient.instance.registerVolunteer(request)
+                                    if (resp.isSuccessful && resp.body()?.code == 200) {
+                                        Toast.makeText(context, "志愿者注册成功，请登录", Toast.LENGTH_SHORT).show()
+                                        isLoginMode = true // 切换回登录模式
+                                    } else {
+                                        Toast.makeText(context, "注册失败: ${resp.body()?.msg}", Toast.LENGTH_SHORT).show()
+                                    }
+                                } else {
+                                    // --- 普通登录/注册逻辑 ---
+                                    val codeInt = verificationCode.toIntOrNull() ?: 0
+                                    val request = EmailRegisterOrLoginRequest(email = email, role = selectedRole, verificationCode = codeInt)
+                                    val resp = if (isLoginMode) NetworkClient.instance.loginByEmail(request) else NetworkClient.instance.registerByEmail(request)
+                                    val token = (resp.body()?.data as? String) ?: (resp.body()?.data as? Map<*, *>)?.get("token") as? String
 
-                                            // 使用反射或者直接访问（取决于你的 UserInfo 定义）
-                                            // 简单起见，这里假设它就是那个对象
-                                            if (userInfo is com.example.yixiu_1.network.UserInfo) {
+                                    if (token != null) {
+                                        userPreferences.token = token
+                                        NetworkClient.setToken(token)
+                                        userPreferences.isLoggedIn = true
+                                        try {
+                                            val uResp = NetworkClient.instance.getUserInfo()
+                                            val userInfo = uResp.body()?.data
+                                            if (userInfo != null && userInfo is com.example.yixiu_1.network.UserInfo) {
                                                 userPreferences.userId = userInfo.userId
-
                                                 userPreferences.userEmail = userInfo.email
                                                 userPreferences.nickname = userInfo.username
                                                 userPreferences.userRole = userInfo.role
-                                                // 更新头像
                                                 userPreferences.avatarPath = userInfo.avatar
                                             }
+                                        } catch (e: Exception) {
+                                            Log.e("Auth", "Fetch user info failed", e)
                                         }
-                                    } catch (e: Exception) {
-                                        Log.e("Auth", "Fetch user info failed", e)
+                                        onLoginSuccess()
+                                        Toast.makeText(context, if (isLoginMode) "登录成功" else "注册成功", Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        Toast.makeText(context, "操作失败: ${resp.body()?.msg ?: "未知错误"}", Toast.LENGTH_SHORT).show()
                                     }
-
-                                    onLoginSuccess()
-                                    Toast.makeText(context, if (isLoginMode) "登录成功" else "注册成功", Toast.LENGTH_SHORT).show()
-                                } else {
-                                    Toast.makeText(context, "操作失败: ${resp.body()?.msg ?: "未知错误"}", Toast.LENGTH_SHORT).show()
                                 }
                             } catch (e: Exception) {
                                 Toast.makeText(context, "错误: ${e.message}", Toast.LENGTH_SHORT).show()
@@ -703,15 +844,16 @@ fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, 
                     },
                     modifier = Modifier.fillMaxWidth(),
                     enabled = !isLoading
-                ) { Text(if (isLoginMode) "登录" else "注册") }
+                ) { Text(if (isLoginMode) "登录" else "注册", color = Color.White) }
 
                 TextButton(onClick = { isLoginMode = !isLoginMode }) {
-                    Text(if (isLoginMode) "没有账户？去注册" else "已有账户？去登录", color = Color.White)
+                    Text(if (isLoginMode) "没有账户？去注册" else "已有账户？去登录", color = Color.Black)
                 }
             }
         }
     }
 }
+
 
 
 
@@ -876,7 +1018,7 @@ fun AppointmentQuestionnaireScreen(
                     OutlinedTextField(
                         value = deviceType,
                         onValueChange = { deviceType = it },
-                        label = { Text("设备类型 (如电脑)") },
+                        label = { Text("设备类型 (如电脑，必填)") },
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(12.dp),
                         colors = textFieldColors
@@ -884,7 +1026,7 @@ fun AppointmentQuestionnaireScreen(
                     OutlinedTextField(
                         value = deviceSystem,
                         onValueChange = { deviceSystem = it },
-                        label = { Text("系统 (如Win10)") },
+                        label = { Text("系统 (如Win10,必填)") },
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(12.dp),
                         colors = textFieldColors
@@ -906,7 +1048,7 @@ fun AppointmentQuestionnaireScreen(
                 OutlinedTextField(
                     value = appointmentTime,
                     onValueChange = { appointmentTime = it },
-                    label = { Text("期望预约时间") },
+                    label = { Text("期望预约时间(必填)") },
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp),
                     colors = textFieldColors
@@ -934,8 +1076,8 @@ fun AppointmentQuestionnaireScreen(
                                 Toast.makeText(context, "请先登录", Toast.LENGTH_SHORT).show()
                                 return@launch
                             }
-                            if (description.isBlank() || location.isBlank() || contactInfo.isBlank()) {
-                                Toast.makeText(context, "请填写必填项(描述、地址、联系方式)", Toast.LENGTH_SHORT).show()
+                            if (description.isBlank() || location.isBlank() || contactInfo.isBlank() || deviceType.isBlank() || deviceSystem.isBlank() || appointmentTime.isBlank()) {
+                                Toast.makeText(context, "请填写必填项(描述、地址、联系方式、设备类型和系统、期望预约时间)", Toast.LENGTH_SHORT).show()
                                 return@launch
                             }
                             try {
@@ -1251,6 +1393,168 @@ fun DetailRow(label: String, value: String, highlight: Boolean = false) {
     Divider(color = Color.Black.copy(alpha = 0.1f))
 }
 
+
+
+@Composable
+fun MessageCenterScreen(
+    modifier: Modifier = Modifier,
+    userPreferences: UserPreferences
+) {
+    var allNotifications by remember { mutableStateOf<List<NotifyItem>>(emptyList()) }
+    var isLoading by remember { mutableStateOf(true) }
+    val context = LocalContext.current
+
+    // 筛选逻辑
+    val filterOptions = listOf("全部", "系统消息", "广播消息", "用户消息")
+    var selectedFilter by remember { mutableStateOf("全部") }
+    var showFilterMenu by remember { mutableStateOf(false) }
+
+    val filteredNotifications = remember(selectedFilter, allNotifications) {
+        when (selectedFilter) {
+            "系统消息" -> allNotifications.filter { it.type == "SYSTEM" }
+            "广播消息" -> allNotifications.filter { it.type == "BROADCAST" }
+            "用户消息" -> allNotifications.filter { it.type == "USER" }
+            else -> allNotifications // "全部"
+        }
+    }
+
+    // 数据加载
+    LaunchedEffect(Unit) {
+        if (!userPreferences.isLoggedIn) {
+            Toast.makeText(context, "请先登录", Toast.LENGTH_SHORT).show()
+            isLoading = false
+            return@LaunchedEffect
+        }
+        try {
+            val response = NetworkClient.instance.getNotifications()
+            if (response.isSuccessful && response.body()?.code == 200) {
+                allNotifications = (response.body()?.data ?: emptyList()).sortedByDescending { it.createTime }
+            } else {
+                Toast.makeText(context, "加载消息失败: ${response.message()}", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: Exception) {
+            Toast.makeText(context, "网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
+        } finally {
+            isLoading = false
+        }
+    }
+
+    Column(modifier = modifier.fillMaxSize()) {
+        // 筛选器下拉菜单
+        Box(modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp)) {
+            OutlinedButton(
+                onClick = { showFilterMenu = !showFilterMenu },
+                modifier = Modifier.align(Alignment.CenterStart)
+            ) {
+                Text(selectedFilter)
+                Icon(
+                    imageVector = if (showFilterMenu) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                    contentDescription = "筛选菜单"
+                )
+            }
+            DropdownMenu(
+                expanded = showFilterMenu,
+                onDismissRequest = { showFilterMenu = false }
+            ) {
+                filterOptions.forEach { option ->
+                    DropdownMenuItem(
+                        text = { Text(option) },
+                        onClick = {
+                            selectedFilter = option
+                            showFilterMenu = false
+                        }
+                    )
+                }
+            }
+        }
+
+        // 消息列表
+        if (isLoading) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator()
+            }
+        } else if (filteredNotifications.isEmpty()) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(
+                    text = "暂无消息",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = Color.Gray
+                )
+            }
+        } else {
+            LazyColumn(
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                items(filteredNotifications) { notification ->
+                    NotificationCard(item = notification)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun NotificationCard(item: NotifyItem) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White)
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // 左侧：头像和未读标记
+            Box(modifier = Modifier.size(48.dp)) {
+                AvatarImage(
+                    path = item.senderAvatar,
+                    modifier = Modifier.fillMaxSize()
+                )
+                // 如果未读，显示一个小红点
+                if (item.isRead == 0) {
+                    Box(
+                        modifier = Modifier
+                            .size(12.dp)
+                            .background(Color.Red, CircleShape)
+                            .border(2.dp, Color.White, CircleShape)
+                            .align(Alignment.TopEnd)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.width(12.dp))
+
+            // 中间：标题和发送者
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = item.title,
+                    fontWeight = if (item.isRead == 0) FontWeight.Bold else FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.bodyLarge
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "来自: ${item.senderUsername ?: "系统"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.Gray
+                )
+            }
+
+            Spacer(modifier = Modifier.width(12.dp))
+
+            // 右侧：时间
+            Text(
+                text = item.createTime.substringBefore("T"), // 只显示日期部分
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.Gray
+            )
+        }
+    }
+}
 // ===================== 5. Preview =====================
 @Preview(showBackground = true)
 @Composable
