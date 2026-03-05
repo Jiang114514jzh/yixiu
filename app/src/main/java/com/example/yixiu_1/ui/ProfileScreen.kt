@@ -63,6 +63,7 @@ fun ProfileScreen(
     var isEditingNickname by remember { mutableStateOf(false) }
     var editingNicknameText by remember(isEditingNickname) { mutableStateOf(nickname) }
     val maxNicknameLength = 20
+    var isSubmittingNickname by remember { mutableStateOf(false) }
 
     val imagePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
@@ -175,25 +176,72 @@ fun ProfileScreen(
                             )
                             Row(
                                 modifier = Modifier.fillMaxWidth(0.8f),
-                                horizontalArrangement = Arrangement.End
+                                horizontalArrangement = Arrangement.End,
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                TextButton(onClick = { isEditingNickname = false }) {
+                                TextButton(
+                                    onClick = { isEditingNickname = false },
+                                    enabled = !isSubmittingNickname // 提交期间禁止点击取消
+                                ) {
                                     Text("取消")
                                 }
                                 Spacer(modifier = Modifier.width(8.dp))
                                 TextButton(
                                     onClick = {
-                                        if (editingNicknameText.isNotBlank()) {
-                                            userPreferences.nickname = editingNicknameText
-                                            nickname = editingNicknameText
-                                            isEditingNickname = false
-                                            Toast.makeText(context, "昵称已更新", Toast.LENGTH_SHORT).show()
-                                        } else {
+                                        if (editingNicknameText.isBlank()) {
                                             Toast.makeText(context, "昵称不能为空", Toast.LENGTH_SHORT).show()
+                                            return@TextButton
                                         }
-                                    }
+
+                                        isSubmittingNickname = true
+                                        scope.launch {
+                                            try {
+                                                // 1. 发起修改昵称的请求 (确保之前在 ApiService 加上了 UpdateUserInfoRequest)
+                                                val updateRequest = com.example.yixiu_1.network.UpdateUserInfoRequest(username = editingNicknameText)
+                                                val updateResponse = NetworkClient.instance.updateUserInfo(updateRequest)
+
+                                                if (updateResponse.isSuccessful && updateResponse.body()?.code == 200) {
+                                                    // 2. 修改成功后，立刻重新获取最新的用户信息
+                                                    val userInfoResponse = NetworkClient.instance.getUserInfo()
+
+                                                    if (userInfoResponse.isSuccessful && userInfoResponse.body()?.code == 200) {
+                                                        val userInfo = userInfoResponse.body()?.data
+                                                        if (userInfo != null) {
+                                                            // 3. 更新本地缓存和 UI 状态
+                                                            userPreferences.nickname = userInfo.username
+                                                            nickname = userInfo.username // 立刻刷新页面上的名字
+
+                                                            Toast.makeText(context, "昵称修改成功", Toast.LENGTH_SHORT).show()
+                                                            isEditingNickname = false // 关闭编辑框
+                                                        }
+                                                    } else {
+                                                        Toast.makeText(context, "昵称已修改，但刷新数据失败", Toast.LENGTH_SHORT).show()
+                                                        isEditingNickname = false
+                                                    }
+                                                } else {
+                                                    val msg = updateResponse.body()?.msg ?: "未知错误"
+                                                    Toast.makeText(context, "修改失败: $msg", Toast.LENGTH_SHORT).show()
+                                                }
+                                            } catch (e: Exception) {
+                                                e.printStackTrace()
+                                                Toast.makeText(context, "网络请求异常: ${e.message}", Toast.LENGTH_SHORT).show()
+                                            } finally {
+                                                isSubmittingNickname = false
+                                            }
+                                        }
+                                    },
+                                    enabled = !isSubmittingNickname // 提交期间禁止重复点击
                                 ) {
-                                    Text("保存")
+                                    if (isSubmittingNickname) {
+                                        // 提交时显示小圆圈动画
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(16.dp),
+                                            strokeWidth = 2.dp,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    } else {
+                                        Text("保存")
+                                    }
                                 }
                             }
                         }
