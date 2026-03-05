@@ -48,9 +48,9 @@ dependencies {
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
-	// Material Icons Extended
+
 	implementation("androidx.compose.material:material-icons-extended")
-	// Compose text input (KeyboardOptions)
+
 	implementation("androidx.compose.ui:ui-text")
 	// Networking
 	implementation("com.squareup.retrofit2:retrofit:2.11.0")

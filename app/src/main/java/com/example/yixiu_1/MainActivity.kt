@@ -96,6 +96,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import com.example.yixiu_1.network.*
+import com.example.yixiu_1.ui.EditProfileScreen
 import com.example.yixiu_1.ui.PostDetailScreen
 
 
@@ -154,6 +155,7 @@ sealed class Screen {
     data class Community(val preloadedPosts: List<com.example.yixiu_1.network.CommunityPostItem>? = null) : Screen()
     object MyCollection : Screen()
     object CreatePost : Screen()
+    object EditProfile : Screen()
     data class PostDetail(val postId: Int) : Screen()
 }
 
@@ -928,7 +930,16 @@ private fun AppContentInternal(
                             onNavigateToLogin = { currentScreen = Screen.Login },
                             onLogout = { currentScreen = Screen.Home },
                             onAvatarUpdated = { avatarPath = it },
-                            onBack = { currentScreen = Screen.Home }
+                            onBack = { currentScreen = Screen.Home },
+                            onNavigateToEdit = { currentScreen = Screen.EditProfile }
+                        )
+                    }
+
+                    is Screen.EditProfile -> {
+                        // --- 新增编辑页面分支 ---
+                        EditProfileScreen(
+                            apiService = NetworkClient.instance, // 使用你项目现有的网络客户端
+                            onBack = { currentScreen = Screen.Profile } // 返回时回到个人中心
                         )
                     }
                     is Screen.Login -> {

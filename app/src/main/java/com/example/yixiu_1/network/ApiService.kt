@@ -91,6 +91,20 @@ data class RepairTaskListData(
 data class MarkReadRequest(
     val notifyId: Int
 )
+
+data class UserUpdateRequest(
+    val username: String,
+    val realName: String
+)
+
+data class VolunteerUpdateRequest(
+    val userId: Int,
+    val studentNumber: String,
+    val majorClass: String,
+    val grade: String,
+    val contactType: Int,
+    val contactNumber: String
+)
 //============ 接口定义 ============
 interface ApiService {
     // --- 登录注册相关接口 ---
@@ -104,6 +118,14 @@ interface ApiService {
     suspend fun updateUserInfo(
         @Body request: UpdateUserInfoRequest
     ): Response<ApiResponse<Any>>
+
+    // 修改基本信息 (PUT)
+    @PUT("users/userInfo")
+    suspend fun updateBasicInfo(@Body request: UserUpdateRequest): ApiResponse<Unit>
+
+    // 修改志愿者信息 (PUT 或 POST，根据后端定义，这里默认为修改操作)
+    @PUT("volunteer/info")
+    suspend fun updateVolunteerInfo(@Body request: VolunteerUpdateRequest): ApiResponse<Unit>
 
     @POST("/api/v1/users/loginByEmail")
     suspend fun loginByEmail(@Body body: EmailRegisterOrLoginRequest): Response<ApiResponse<Any>>

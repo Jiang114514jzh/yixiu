@@ -25,7 +25,20 @@ data class UserInfo(
     @SerializedName("role") val role: String,
     @SerializedName("status") val status: String?,
     @SerializedName("lastLogin") val lastLogin: String?,
-    @SerializedName("volunteerInfo") val volunteerInfo: Any? // volunteerInfo 结构不确定，用 Any? 兼容
+    @SerializedName("volunteerInfo") val volunteerInfo: VolunteerInfo?
+)
+
+data class VolunteerInfo(
+    @SerializedName("volunteerId") val volunteerId: Int,
+    @SerializedName("userId") val userId: Int,
+    @SerializedName("studentNumber") val studentNumber: String?,
+    @SerializedName("majorClass") val majorClass: String?,
+    @SerializedName("grade") val grade: String?,
+    @SerializedName("status") val status: Int,
+    @SerializedName("contactType") val contactType: String?,
+    @SerializedName("contactNumber") val contactNumber: String?,
+    @SerializedName("createTime") val createTime: String?,
+    @SerializedName("updateTime") val updateTime: String?
 )
 
 /**

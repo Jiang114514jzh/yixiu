@@ -1,6 +1,7 @@
 package com.example.yixiu_1.ui
 
 import android.net.Uri
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -16,36 +17,34 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.ArrowBack
+
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import android.util.Log
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.setValue
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
-import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import com.example.yixiu_1.data.UserPreferences
 import com.example.yixiu_1.network.NetworkClient
 import kotlinx.coroutines.launch
-import java.io.File
-import java.io.FileOutputStream
-import java.io.InputStream
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.MultipartBody
 import okhttp3.RequestBody.Companion.asRequestBody
+import java.io.File
+import java.io.FileOutputStream
 
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalSharedTransitionApi::class)
 @Composable
 fun ProfileScreen(
     userPreferences: UserPreferences,
+    onNavigateToEdit: () -> Unit,
     onNavigateToLogin: () -> Unit,
     onLogout: () -> Unit,
     sharedTransitionScope: SharedTransitionScope,
@@ -275,6 +274,17 @@ fun ProfileScreen(
                 if (isLoggedIn) {
                     Button(onClick = { imagePickerLauncher.launch("image/*") }, modifier = Modifier.fillMaxWidth()) {
                         Text("上传头像")
+                    }
+                    // 在 ProfileScreen 适当位置添加
+                    Button(
+                        onClick = { onNavigateToEdit() }, // 直接执行回调，不使用 navController
+                        modifier = Modifier.padding(top = 8.dp).fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+                    ) {
+                        // 使用你已经 import 过的 AccountCircle 替代 Edit 图标
+                        Icon(Icons.Default.AccountCircle, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("完善个人信息")
                     }
                     Spacer(modifier = Modifier.height(8.dp))
                     Button(
