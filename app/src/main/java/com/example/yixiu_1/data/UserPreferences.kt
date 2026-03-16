@@ -3,6 +3,8 @@ package com.example.yixiu_1.data
 import android.content.Context
 import android.util.Log
 import com.example.yixiu_1.network.RepairHistoryItem
+import com.example.yixiu_1.network.VolunteerDetail // 【新增导入】确保导入你的数据类
+import com.example.yixiu_1.network.VolunteerInfo
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 
@@ -39,17 +41,64 @@ class UserPreferences(context: Context) {
         get() = prefs.getString("avatar_path", null)
         set(value) = prefs.edit().putString("avatar_path", value).apply()
 
+    // ================== 【新增】志愿者信息管理 ==================
+
+    /**
+     * 存取完整的志愿者信息对象
+     */
+    var volunteerInfo: VolunteerInfo?
+        get() {
+            val json = prefs.getString("volunteer_info", null)
+            return if (json != null) {
+                try {
+                    gson.fromJson(json, VolunteerInfo::class.java)
+                } catch (e: Exception) {
+                    Log.e("UserPreferences", "解析 VolunteerDetail 失败", e)
+                    null
+                }
+            } else {
+                null
+            }
+        }
+        set(value) {
+            if (value != null) {
+                prefs.edit().putString("volunteer_info", gson.toJson(value)).apply()
+            } else {
+                // 如果传入 null，则清除该字段
+                prefs.edit().remove("volunteer_info").apply()
+            }
+        }
+
+    /**
+     * 快捷获取 volunteerId (接取任务时直接调用 userPreferences.volunteerId 即可)
+     * 如果不是志愿者或没有信息，返回 -1
+     */
+    val volunteerId: Int
+        get() = volunteerInfo?.volunteerId ?: -1
+
+    // =========================================================
+
     fun getNicknameOrGenerate(): String {
         return nickname ?: userEmail?.substringBefore('@') ?: "游客"
     }
 
-    // 【新增】辅助方法：一次性保存登录信息，代码更整洁
-    fun saveLoginInfo(token: String, userId: Int, username: String, userEmail: String, avatarPath: String?) {
+    // 【修改】保存登录信息时，支持传入 volunteerInfo
+    fun saveLoginInfo(
+        token: String,
+        userId: Int,
+        username: String,
+        userEmail: String,
+        avatarPath: String?,
+        role: String?,
+        volunteerInfo: VolunteerInfo? = null // 【修复 1】：把参数名和你的数据类类型对齐，改为 volunteerInfo
+    ) {
         this.token = token
         this.userId = userId
         this.nickname = username
         this.userEmail = userEmail
         this.avatarPath = avatarPath
+        this.userRole = role
+        this.volunteerInfo = volunteerInfo // 【修复 2】：现在能正确把传进来的参数赋值给本地存储了
         this.isLoggedIn = true
     }
 
@@ -58,21 +107,18 @@ class UserPreferences(context: Context) {
         clear()
     }
 
-    // 【关键修改】Key 绑定 userId，实现多账号数据隔离
+    // Key 绑定 userId，实现多账号数据隔离
     private fun getHistoryKey(): String {
         return "repair_history_$userId"
     }
 
     fun addRepairHistory(item: RepairHistoryItem) {
-        // 如果未登录（userId 为 -1），不保存或者保存到临时 key
         if (userId == -1) return
 
         try {
             val history = getRepairHistory().toMutableList()
-            // 将新条目添加到列表头部（最新的在最上面）
             history.add(0, item)
             val json = gson.toJson(history)
-            // 使用带 userId 的 Key 保存
             prefs.edit().putString(getHistoryKey(), json).apply()
             Log.d("UserPreferences", "已保存本地报修记录: $item")
         } catch (e: Exception) {
@@ -81,11 +127,9 @@ class UserPreferences(context: Context) {
     }
 
     fun getRepairHistory(): List<RepairHistoryItem> {
-        // 如果未登录，返回空列表
         if (userId == -1) return emptyList()
 
         return try {
-            // 使用带 userId 的 Key 读取
             val json = prefs.getString(getHistoryKey(), null)
             if (json != null) {
                 val type = object : TypeToken<List<RepairHistoryItem>>() {}.type
@@ -113,8 +157,7 @@ class UserPreferences(context: Context) {
             .remove("user_role")
             .remove("avatar_path")
             .remove("nickname")
-            // 注意：这里我们通常不清除 repair_history_xxx，保留本地缓存记录供下次登录查看
-            // 如果你希望退出登录就清空该手机上的所有记录，可以在这里遍历清除
+            .remove("volunteer_info") // 【新增】退出登录时清除志愿者信息
             .apply()
     }
 }

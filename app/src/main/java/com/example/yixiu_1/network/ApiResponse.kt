@@ -35,7 +35,7 @@ data class VolunteerInfo(
     @SerializedName("majorClass") val majorClass: String?,
     @SerializedName("grade") val grade: String?,
     @SerializedName("status") val status: Int,
-    @SerializedName("contactType") val contactType: String?,
+    @SerializedName("contactType") val contactType: Int?,
     @SerializedName("contactNumber") val contactNumber: String?,
     @SerializedName("createTime") val createTime: String?,
     @SerializedName("updateTime") val updateTime: String?
@@ -55,4 +55,72 @@ data class EmailRegisterOrLoginRequest(
     val email: String,
     val role: String,
     val verificationCode: Int
+)
+
+/**
+ * 用户详情主数据 (UserProfile)
+ */
+data class UserProfile(
+    val userInfoVO: UserInfoVO,
+    val communityStatisticDto: CommunityStatisticDto,
+    val volunteerDataVO: VolunteerDataVO?,
+    val role: String,
+    @SerializedName("isFollow")
+    val isFollow: Boolean,
+    val visitedNum: Int,
+    val lastLoginTime: String
+)
+
+/**
+ * 用户基本信息
+ */
+data class UserInfoVO(
+    val userId: Long,
+    val username: String,
+    val avatar: String,
+    val userSignature: String? // JSON 中为 null，建议设为可空
+)
+
+/**
+ * 社区统计数据
+ */
+data class CommunityStatisticDto(
+    val userId: Long,
+    val postNum: Int,
+    val followNum: Int,
+    val fansNum: Int,
+    val getLikeNum: Int
+)
+
+/**
+ * 志愿者相关数据
+ */
+data class VolunteerDataVO(
+    val volunteerId: Long,
+    val grade: String,
+    val status: Int,
+    val fixedNum: Int,
+    val finishRate: Double, // 对应 0.1429
+    val contactType: Int,
+    val contactNumber: String
+)
+
+data class FollowUserItem(
+    @SerializedName("followUserId")
+    val userId: Int,
+    @SerializedName("followUsername")
+    val username: String,
+    @SerializedName("followUserAvatar")
+    val avatar: String?,
+    @SerializedName("followUserSignature")
+    val userSignature: String?
+)
+
+data class FollowPage(
+    val total: Int,
+    val list: List<FollowUserItem>,
+    val pageNum: Int,
+    val pageSize: Int,
+    val pages: Int,
+    val hasNextPage: Boolean
 )

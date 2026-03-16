@@ -7,6 +7,14 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.ui.draw.blur
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -35,6 +43,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.ui.draw.blur
+import kotlinx.coroutines.CoroutineScope
 import coil.compose.AsyncImage
 import com.example.yixiu_1.AvatarImage
 import com.example.yixiu_1.data.UserPreferences
@@ -95,12 +107,14 @@ fun  CommunityScreen(
     onBack: () -> Unit,
     preloadedPosts: List<CommunityPostItem>? = null,
     onNavigateToMyCollection: () -> Unit,
+    onUserClick: (Int) -> Unit, // 【新增此参数】
     onPostClick: (Int) -> Unit // 【修复 1】添加缺失的跳转回调参数
 ) {
     // 0: 社区主页, 1: 我的
     var selectedTab by remember { mutableIntStateOf(0) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    var currentViewUserId by remember { mutableStateOf<Int?>(null) }
 
 
     Scaffold(
@@ -136,7 +150,8 @@ fun  CommunityScreen(
                 // 【修复 2】传入 initialPosts 和 onPostClick
                 CommunityHomeContent(
                     initialPosts = preloadedPosts,
-                    onPostClick = onPostClick
+                    onPostClick = onPostClick,
+                    onUserClick = onUserClick // 【向下传递给首页列表】
                 )
             } else {
                 // 【修复 3】传入 onPostClick
@@ -144,7 +159,8 @@ fun  CommunityScreen(
                     userId = userPreferences.userId,
                     userPreferences = userPreferences,
                     onNavigateToMyCollection = onNavigateToMyCollection,
-                    onPostClick = onPostClick
+                    onPostClick = onPostClick,
+                    onUserClick = onUserClick // 【向下传递给我的列表】
                 )
             }
         }
@@ -214,22 +230,48 @@ fun CommunityBottomBar(selectedTab: Int, onTabSelected: (Int) -> Unit) {
 @Composable
 fun CommunityHomeContent(
     initialPosts: List<CommunityPostItem>? = null,
-    onPostClick: (Int) -> Unit // 【修复 4】添加缺失的参数
+    onPostClick: (Int) -> Unit,
+    onUserClick: (Int) -> Unit
 ) {
     var posts by remember { mutableStateOf(initialPosts ?: emptyList()) }
     var isLoading by remember { mutableStateOf(initialPosts == null) }
     var pageNum by remember { mutableIntStateOf(1) }
+    var refreshTrigger by remember { mutableIntStateOf(0) }
+    var hasMoreData by remember { mutableStateOf(false) }
+    val listState = rememberLazyListState()
+
     val context = LocalContext.current
     val userPreferences = remember { UserPreferences(context)}
     val scope = rememberCoroutineScope()
 
-    LaunchedEffect(pageNum) {
-        if (pageNum == 1 && initialPosts != null && posts.isNotEmpty()) return@LaunchedEffect
-        isLoading = true
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                refreshTrigger += 1
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    LaunchedEffect(pageNum, refreshTrigger) {
+        if (posts.isEmpty()) {
+            isLoading = true
+        }
         try {
             val response = NetworkClient.instance.getCommunityPosts(pageNum, 10)
             if (response.isSuccessful && response.body()?.code == 200) {
-                posts = response.body()?.data?.list ?: emptyList()
+                val pageData = response.body()?.data
+                posts = pageData?.list ?: emptyList()
+                val total = pageData?.total ?: 0
+                hasMoreData = (pageNum * 10) < total
+
+                if (posts.isNotEmpty()) {
+                    listState.scrollToItem(0)
+                }
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -238,80 +280,92 @@ fun CommunityHomeContent(
         }
     }
 
+    // 【修改】：去掉了原本新增的 Column 和 Box，直接渲染 PostList
     PostList(
         posts = posts,
         isLoading = isLoading,
         emptyText = "暂无帖子",
+        onDeleteSuccess = {
+            pageNum = 1
+            refreshTrigger += 1
+        },
         onFavoriteToggle = { post ->
-            // 【注意】此处原逻辑是控制收藏 (isFavorite)，若需控制点赞，请将字段改为 isLiked 和 likeNum
-            // 并且需要调用对应的点赞接口 (例如 togglePostLike)
-
-            // 1. 计算新状态 (以收藏为例，若改点赞请调整字段)
             val newIsFavorite = if (post.isFavorite == 1) 0 else 1
             val newFavCount = if (newIsFavorite == 1) post.favoriteNum + 1 else post.favoriteNum - 1
-
-            // 2. 乐观更新 UI
             posts = posts.map {
-                if (it.postId == post.postId) {
-                    it.copy(isFavorite = newIsFavorite, favoriteNum = newFavCount)
-                } else {
-                    it
-                }
+                if (it.postId == post.postId) it.copy(isFavorite = newIsFavorite, favoriteNum = newFavCount) else it
             }
-
-            // 3. 发起网络请求
             scope.launch {
-                // 请确保已定义 togglePostFavorite 或对应的点赞函数
                 val success = togglePostFavorite(post, userPreferences)
-
                 if (!success) {
-                    // 4. 失败回滚
                     posts = posts.map {
-                        if (it.postId == post.postId) {
-                            it.copy(isFavorite = post.isFavorite, favoriteNum = post.favoriteNum)
-                        } else {
-                            it
-                        }
+                        if (it.postId == post.postId) it.copy(isFavorite = post.isFavorite, favoriteNum = post.favoriteNum) else it
                     }
                     Toast.makeText(context, "操作失败", Toast.LENGTH_SHORT).show()
                 }
             }
         },
         onLikeToggle = { post ->
-            // 1. 计算新状态
             val newIsLiked = if (post.isLiked == 1) 0 else 1
             val newLikeNum = if (newIsLiked == 1) post.likeNum + 1 else post.likeNum - 1
-
-            // 2. 乐观更新 UI (立即改变界面，提升体验)
             posts = posts.map {
-                if (it.postId == post.postId) {
-                    it.copy(isLiked = newIsLiked, likeNum = newLikeNum)
-                } else {
-                    it
-                }
+                if (it.postId == post.postId) it.copy(isLiked = newIsLiked, likeNum = newLikeNum) else it
             }
-
-            // 3. 发起网络请求
             scope.launch {
                 val success = togglePostLike(post, userPreferences)
-
-                // 4. 如果失败，回滚状态
                 if (!success) {
                     posts = posts.map {
-                        if (it.postId == post.postId) {
-                            it.copy(isLiked = post.isLiked, likeNum = post.likeNum)
-                        } else {
-                            it
-                        }
+                        if (it.postId == post.postId) it.copy(isLiked = post.isLiked, likeNum = post.likeNum) else it
                     }
                     Toast.makeText(context, "点赞操作失败", Toast.LENGTH_SHORT).show()
                 }
             }
         },
-        onItemClick = onPostClick // 【修复 5】修正这里的传参语法，直接将函数传进去
+        onUserClick = onUserClick,
+        onItemClick = onPostClick,
+
+        // 👇【关键新增】：将翻页栏作为组件向下传递，同时增加了底部 padding 防止被悬浮按钮遮挡 👇
+        listFooter = {
+            // 只有当有数据且不在加载时，才显示翻页按钮
+            if (posts.isNotEmpty() && !isLoading) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 16.dp)
+                        .padding(bottom = 5.dp), // 留出 80dp 的底部空白，彻底避开新建帖子悬浮按钮
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Button(
+                        onClick = { if (pageNum > 1) pageNum-- },
+                        enabled = pageNum > 1,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = null)
+                        Spacer(Modifier.width(4.dp))
+                        Text("上一页")
+                    }
+                    Text(
+                        text = "第 $pageNum 页",
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Button(
+                        onClick = { pageNum++ },
+                        enabled = hasMoreData,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("下一页")
+                        Spacer(Modifier.width(4.dp))
+                        Icon(Icons.Default.ArrowForward, contentDescription = null)
+                    }
+                }
+            }
+        },
+                listState = listState
     )
 }
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MyCollectionScreen(
@@ -378,6 +432,7 @@ fun MyCollectionScreen(
                 posts = posts,
                 isLoading = isLoading,
                 emptyText = "暂无收藏内容",
+                onDeleteSuccess = { /* 收藏页通常不处理删除，或在此刷新列表 */ },
                 onFavoriteToggle = { post ->
                     val originalPosts = posts
                     posts = posts.filter { it.postId != post.postId }
@@ -392,7 +447,10 @@ fun MyCollectionScreen(
                 onLikeToggle = { post ->
                     Toast.makeText(context, "请在社区主页进行点赞操作", Toast.LENGTH_SHORT).show()
                 },
-                onItemClick = onPostClick // 【修复 7】传入点击事件
+                onItemClick = onPostClick, // 【修复 7】传入点击事件
+                onUserClick = { clickedId ->
+                    // 如果收藏页也要能点头像，这里可以管理状态，或者暂时传空
+                },
             )
         }
     }
@@ -406,7 +464,8 @@ fun MyCollectionScreen(
 @Composable
 fun PostDetailScreen(
     postId: Int,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onUserClick: (Int) -> Unit
 ) {
     var post by remember { mutableStateOf<CommunityPostItem?>(null) }
     var isLoading by remember { mutableStateOf(true) }
@@ -419,38 +478,30 @@ fun PostDetailScreen(
     var inputText by remember { mutableStateOf("") }
     var currentReplyTarget by remember { mutableStateOf<ReplyTarget>(ReplyTarget.ToPost(postId)) }
 
-    // 获取评论列表的抽离函数（方便评论成功后刷新）
+    // 获取当前用户 ID 和权限状态
+    val currentUserId = userPreferences.userId
+    val isAdmin = userPreferences.userRole == "admin" || userPreferences.userRole == "super_admin"
+
+    // 获取评论列表的抽离函数
     fun fetchCommentsAndReplies() {
         scope.launch {
             try {
-                // 1. 获取该帖子的主评论列表
                 val commentsResponse = NetworkClient.instance.getCommentsByPostId(postId = postId, pageNum = 1, pageSize = 50)
                 if (commentsResponse.isSuccessful && commentsResponse.body()?.code == 200) {
                     val fetchedComments = commentsResponse.body()?.data?.list ?: emptyList()
-
-                    // 2. 并发获取每一条主评论的嵌套回复列表 (极大提升加载速度)
                     val commentsWithReplies = fetchedComments.map { comment ->
                         async {
                             try {
-                                val repliesResponse = NetworkClient.instance.getRepliesByCommentId(
-                                    commentId = comment.commentId,
-                                    pageNum = 1,
-                                    pageSize = 50
-                                )
+                                val repliesResponse = NetworkClient.instance.getRepliesByCommentId(commentId = comment.commentId, pageNum = 1, pageSize = 50)
                                 val fetchedReplies = if (repliesResponse.isSuccessful && repliesResponse.body()?.code == 200) {
                                     repliesResponse.body()?.data?.list ?: emptyList()
-                                } else {
-                                    emptyList()
-                                }
-                                // 将获取到的回复塞入该评论对象中
+                                } else emptyList()
                                 comment.copy(replies = fetchedReplies)
                             } catch (e: Exception) {
                                 comment.copy(replies = emptyList())
                             }
                         }
-                    }.awaitAll() // 等待所有请求完成
-
-                    // 赋值给 UI 状态
+                    }.awaitAll()
                     comments = commentsWithReplies
                 }
             } catch (e: Exception) {
@@ -459,21 +510,15 @@ fun PostDetailScreen(
         }
     }
 
-    // 进入页面时，请求服务器获取帖子详情、评论列表及回复
     LaunchedEffect(postId) {
         isLoading = true
         try {
-            // 获取帖子详情
             val response = NetworkClient.instance.getCommunityPostsByFilterByPostId(postId)
             if (response.isSuccessful && response.body()?.code == 200) {
                 val list = response.body()?.data?.list
-                if (!list.isNullOrEmpty()) {
-                    post = list[0]
-                }
+                if (!list.isNullOrEmpty()) post = list[0]
             }
-            // 触发获取评论
             fetchCommentsAndReplies()
-
         } catch (e: Exception) {
             e.printStackTrace()
             Toast.makeText(context, "加载失败", Toast.LENGTH_SHORT).show()
@@ -482,21 +527,34 @@ fun PostDetailScreen(
         }
     }
 
-    // 提交评论/回复的真实网络逻辑
+    // 删除评论/回复的网络请求函数
+    fun deleteCommentOrReply(commentId: Int?, replyId: Int?) {
+        scope.launch {
+            val token = userPreferences.token?.let { if (it.startsWith("Bearer ")) it else "Bearer $it" } ?: return@launch
+            try {
+                val res = NetworkClient.instance.deleteComment(token, commentId, replyId)
+                if (res.isSuccessful && res.body()?.code == 200) {
+                    Toast.makeText(context, "删除成功", Toast.LENGTH_SHORT).show()
+                    fetchCommentsAndReplies() // 成功后刷新列表
+                } else {
+                    Toast.makeText(context, "删除失败: ${res.body()?.msg}", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                Toast.makeText(context, "网络异常，删除失败", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
     fun submitComment() {
         if (inputText.isBlank()) return
-
         val currentInput = inputText
         val target = currentReplyTarget
-
-        // 1. 立即清空输入框并重置状态，提升用户体验
         inputText = ""
         currentReplyTarget = ReplyTarget.ToPost(postId)
-
         val currentUser = userPreferences.getNicknameOrGenerate()
-        val currentUserId = userPreferences.userId
         val now = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
-        val fakeId = (Math.random() * 10000).toInt() // 临时假ID
+        val fakeId = (Math.random() * 10000).toInt()
 
         scope.launch {
             val token = userPreferences.token ?: return@launch
@@ -505,67 +563,75 @@ fun PostDetailScreen(
             try {
                 when (target) {
                     is ReplyTarget.ToPost -> {
-                        // 乐观更新
-                        comments = comments + PostComment(
-                            commentId = fakeId, userId = currentUserId, username = currentUser,
-                            avatar = userPreferences.avatarPath, content = currentInput, createTime = now,postId = postId,
-                            replies = emptyList()
-                        )
-                        // 网络请求
+                        comments = comments + PostComment(commentId = fakeId, userId = currentUserId, username = currentUser, avatar = userPreferences.avatarPath, content = currentInput, createTime = now, postId = postId, replies = emptyList())
                         val request = AddCommentRequest(postId = postId, content = currentInput)
                         val response = NetworkClient.instance.addComment(authHeader, request)
                         if (response.isSuccessful && response.body()?.code == 200) {
                             Toast.makeText(context, "评论成功", Toast.LENGTH_SHORT).show()
-                            fetchCommentsAndReplies() // 成功后刷新真实数据
+                            val realCommentId = response.body()?.data?.commentId
+                            fetchCommentsAndReplies()
+                            if (realCommentId != null) {
+                                post?.userId?.let { postOwnerId ->
+                                    if (postOwnerId != currentUserId) {
+                                        launch {
+                                            try { NetworkClient.instance.sendCommentNotification(authHeader, SendCommentNotifyRequest(realCommentId, postId, currentInput)) } catch (e: Exception) {}
+                                        }
+                                    }
+                                }
+                            }
                         } else {
                             Toast.makeText(context, "评论失败", Toast.LENGTH_SHORT).show()
-                            comments = comments.filter { it.commentId != fakeId } // 失败回滚
+                            comments = comments.filter { it.commentId != fakeId }
                         }
                     }
                     is ReplyTarget.ToComment -> {
-                        // 乐观更新
                         comments = comments.map { c ->
                             if (c.commentId == target.commentId) {
-                                c.copy(replies = c.replies + PostReply(
-                                    replyId = fakeId, commentId = target.commentId,
-                                    fromUserId = currentUserId, fromUserName = currentUser, fromUserAvatar = userPreferences.avatarPath,
-                                    toUserId = target.targetUserId, toUserName = target.targetUsername, parentReplyId = null,
-                                    content = currentInput, createTime = now
-                                ))
+                                c.copy(replies = c.replies + PostReply(replyId = fakeId, commentId = target.commentId, fromUserId = currentUserId, fromUserName = currentUser, fromUserAvatar = userPreferences.avatarPath, toUserId = target.targetUserId, toUserName = target.targetUsername, parentReplyId = null, content = currentInput, createTime = now))
                             } else c
                         }
-                        // 网络请求
                         val request = AddReplyRequest(commentId = target.commentId, toUserId = target.targetUserId, parentReplyId = null, content = currentInput)
                         val response = NetworkClient.instance.addReply(authHeader, request)
-                        if (response.isSuccessful && response.body()?.code == 200) fetchCommentsAndReplies()
-                        else Toast.makeText(context, "回复失败", Toast.LENGTH_SHORT).show()
+                        if (response.isSuccessful && response.body()?.code == 200) {
+                            fetchCommentsAndReplies()
+                            val realReplyId = response.body()?.data?.replyId ?: return@launch
+                            Toast.makeText(context, "回复成功", Toast.LENGTH_SHORT).show()
+                            if (target.targetUserId != currentUserId) {
+                                launch {
+                                    try { NetworkClient.instance.sendReplyToCommentNotification(authHeader, SendReplyToCommentNotifyRequest(realReplyId, target.commentId, postId, currentInput)) } catch (e: Exception) {}
+                                }
+                            }
+                        } else {
+                            Toast.makeText(context, "回复失败", Toast.LENGTH_SHORT).show()
+                        }
                     }
                     is ReplyTarget.ToReply -> {
-                        // 乐观更新
                         comments = comments.map { c ->
                             if (c.commentId == target.commentId) {
-                                c.copy(replies = c.replies + PostReply(
-                                    replyId = fakeId, commentId = target.commentId,
-                                    fromUserId = currentUserId, fromUserName = currentUser, fromUserAvatar = userPreferences.avatarPath,
-                                    toUserId = target.targetUserId, toUserName = target.targetUsername, parentReplyId = target.replyId,
-                                    content = currentInput, createTime = now
-                                ))
+                                c.copy(replies = c.replies + PostReply(replyId = fakeId, commentId = target.commentId, fromUserId = currentUserId, fromUserName = currentUser, fromUserAvatar = userPreferences.avatarPath, toUserId = target.targetUserId, toUserName = target.targetUsername, parentReplyId = target.replyId, content = currentInput, createTime = now))
                             } else c
                         }
-                        // 网络请求
                         val request = AddReplyRequest(commentId = target.commentId, toUserId = target.targetUserId, parentReplyId = target.replyId, content = currentInput)
                         val response = NetworkClient.instance.addReply(authHeader, request)
-                        if (response.isSuccessful && response.body()?.code == 200) fetchCommentsAndReplies()
-                        else Toast.makeText(context, "回复失败", Toast.LENGTH_SHORT).show()
+                        if (response.isSuccessful && response.body()?.code == 200) {
+                            fetchCommentsAndReplies()
+                            val realReplyId = response.body()?.data?.replyId ?: return@launch
+                            Toast.makeText(context, "回复成功", Toast.LENGTH_SHORT).show()
+                            if (target.targetUserId != currentUserId) {
+                                launch {
+                                    try { NetworkClient.instance.sendReplyToReplyNotification(authHeader, SendReplyToReplyNotifyRequest(realReplyId, target.commentId, postId, currentInput, target.replyId.toString())) } catch (e: Exception) {}
+                                }
+                            }
+                        } else {
+                            Toast.makeText(context, "回复失败", Toast.LENGTH_SHORT).show()
+                        }
                     }
                 }
             } catch (e: Exception) {
-                e.printStackTrace()
                 Toast.makeText(context, "网络异常，发布失败", Toast.LENGTH_SHORT).show()
             }
         }
     }
-
 
     Scaffold(
         topBar = {
@@ -584,20 +650,27 @@ fun PostDetailScreen(
                 Text("未找到内容", modifier = Modifier.align(Alignment.Center), color = Color.Gray)
             } else {
                 val item = post!!
+                // 判断是否拥有全局删除权限 (管理员 或 帖主本身)
+                val hasGlobalDeletePermission = isAdmin || (item.userId == currentUserId)
 
-                // 将整个页面改为 LazyColumn
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(bottom = 100.dp) // 底部留白，防止被输入框遮挡
+                    contentPadding = PaddingValues(bottom = 100.dp)
                 ) {
-                    // --- 1. 帖子正文区 ---
                     item {
-                        Column(modifier = Modifier.background(Color.White).padding(16.dp)) {
+                        // 【修改 1】：增加 fillMaxWidth() 解决占不满屏幕的问题
+                        Column(modifier = Modifier.fillMaxWidth().background(Color.White).padding(16.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                AvatarImage(path = item.avatar, modifier = Modifier.size(48.dp))
+                                AvatarImage(
+                                    path = item.avatar,
+                                    modifier = Modifier.size(48.dp).clickable { onUserClick(item.userId) }
+                                )
                                 Spacer(modifier = Modifier.width(12.dp))
                                 Column {
-                                    Text(item.username ?: "未知用户", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                    // 【修改 3】：用户名称超过7个字限制显示
+                                    val rawName = item.username ?: "未知用户"
+                                    val displayUsername = if (rawName.length > 7) rawName.take(7) + "..." else rawName
+                                    Text(displayUsername, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                                     Text(item.createTime?.replace("T", " ")?.substringBefore(".") ?: "", color = Color.Gray, fontSize = 12.sp)
                                 }
                             }
@@ -608,80 +681,56 @@ fun PostDetailScreen(
                             Spacer(modifier = Modifier.height(16.dp))
                             if (!item.imgUrls.isNullOrEmpty()) {
                                 item.imgUrls.forEach { url ->
-                                    AsyncImage(
-                                        model = url, contentDescription = null,
-                                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clip(RoundedCornerShape(8.dp)),
-                                        contentScale = ContentScale.FillWidth
-                                    )
+                                    AsyncImage(model = url, contentDescription = null, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clip(RoundedCornerShape(8.dp)), contentScale = ContentScale.FillWidth)
                                 }
                             }
                         }
                         Spacer(modifier = Modifier.height(8.dp))
                     }
 
-                    // --- 2. 评论区头部 ---
                     item {
                         Surface(color = Color.White, modifier = Modifier.fillMaxWidth()) {
-                            Text(
-                                text = "全部评论 (${comments.size + comments.sumOf { it.replies.size }})",
-                                modifier = Modifier.padding(16.dp),
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 16.sp
-                            )
+                            Text("全部评论 (${comments.size + comments.sumOf { it.replies.size }})", modifier = Modifier.padding(16.dp), fontWeight = FontWeight.Bold, fontSize = 16.sp)
                         }
                         HorizontalDivider(color = Color(0xFFEEEEEE))
                     }
 
-                    // --- 3. 评论列表 ---
                     items(comments, key = { it.commentId }) { comment ->
                         CommentItemView(
                             comment = comment,
                             currentReplyTarget = currentReplyTarget,
                             inputText = inputText,
+                            hasDeletePermission = hasGlobalDeletePermission,
                             onInputTextChange = { inputText = it },
                             onReplyClick = { target ->
                                 currentReplyTarget = if (currentReplyTarget == target) ReplyTarget.ToPost(postId) else target
                             },
-                            onSubmit = { submitComment() }
+                            onUserClick = onUserClick,
+                            onSubmit = { submitComment() },
+                            onDeleteClick = { cId, rId -> deleteCommentOrReply(cId, rId) }
                         )
                         HorizontalDivider(color = Color(0xFFEEEEEE), modifier = Modifier.padding(start = 56.dp))
                     }
                 }
 
-                // --- 4. 底部悬浮的主回复框 (针对整个帖子) ---
                 if (currentReplyTarget is ReplyTarget.ToPost) {
                     Surface(
                         modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth(),
                         shadowElevation = 8.dp,
                         color = Color.White
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
+                        Row(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                             OutlinedTextField(
                                 value = inputText,
                                 onValueChange = { if (it.length <= 200) inputText = it },
                                 placeholder = { Text("请输入评论...", color = Color.Gray) },
-                                modifier = Modifier.weight(1f).heightIn(min = 48.dp, max = 100.dp), // 支持多行自适应高度
+                                modifier = Modifier.weight(1f).heightIn(min = 48.dp, max = 100.dp),
                                 shape = RoundedCornerShape(24.dp),
-                                colors = TextFieldDefaults.colors(
-                                    focusedContainerColor = Color(0xFFF5F5F5),
-                                    unfocusedContainerColor = Color(0xFFF5F5F5),
-                                    focusedIndicatorColor = Color.Transparent,
-                                    unfocusedIndicatorColor = Color.Transparent
-                                ),
-                                trailingIcon = {
-                                    Text("${inputText.length}/200", color = Color.Gray, fontSize = 12.sp, modifier = Modifier.padding(end = 12.dp))
-                                }
+                                colors = TextFieldDefaults.colors(focusedContainerColor = Color(0xFFF5F5F5), unfocusedContainerColor = Color(0xFFF5F5F5), focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent),
+                                trailingIcon = { Text("${inputText.length}/200", color = Color.Gray, fontSize = 12.sp, modifier = Modifier.padding(end = 12.dp)) }
                             )
                             Spacer(modifier = Modifier.width(12.dp))
-                            Button(
-                                onClick = { submitComment() },
-                                enabled = inputText.isNotBlank(),
-                                shape = RoundedCornerShape(24.dp),
-                                contentPadding = PaddingValues(horizontal = 16.dp)
-                            ) {
+                            Button(onClick = { submitComment() }, enabled = inputText.isNotBlank(), shape = RoundedCornerShape(24.dp), contentPadding = PaddingValues(horizontal = 16.dp)) {
                                 Text("发表")
                             }
                         }
@@ -698,7 +747,11 @@ fun PostList(
     emptyText: String,
     onFavoriteToggle: (CommunityPostItem) -> Unit,
     onLikeToggle: (CommunityPostItem) -> Unit,
-    onItemClick: (Int) -> Unit
+    onDeleteSuccess: () -> Unit,
+    onUserClick: (Int) -> Unit, // 【必须新增此参数】
+    onItemClick: (Int) -> Unit,
+    listFooter: @Composable () -> Unit = {},
+    listState: LazyListState = rememberLazyListState()
 ) {
     if (isLoading && posts.isEmpty()) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -710,18 +763,23 @@ fun PostList(
         }
     } else {
         LazyColumn(
+            state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(bottom = 80.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             items(posts, key = { it.postId }) { post ->
-                // 【修复 8】使用显式命名参数，避免解析混乱
                 PostCard(
                     post = post,
                     onFavoriteToggle = onFavoriteToggle,
                     onLikeToggle = onLikeToggle,
+                    onDeleteSuccess = onDeleteSuccess,
+                    onUserClick = onUserClick, // 【最终传递给 PostCard】
                     onClick = { onItemClick(post.postId) }
                 )
+            }
+            item {
+                listFooter()
             }
         }
     }
@@ -732,27 +790,82 @@ fun PostCard(
     post: CommunityPostItem,
     onFavoriteToggle: (CommunityPostItem) -> Unit,
     onLikeToggle: (CommunityPostItem) -> Unit,
+    onDeleteSuccess: () -> Unit,
+    onUserClick: (Int) -> Unit, // 【必须新增此参数】
     onClick: () -> Unit
 ) {
-    // 【新增】记录当前被点击查看的大图 URL，null 表示未打开
+    val context = LocalContext.current
+    val userPreferences = remember { UserPreferences(context) }
+
     var clickedImageUrl by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    var showDeleteDialog by remember { mutableStateOf(false) }
+
+    val userRole = userPreferences.userRole
+    val isAdmin = userRole == "admin" || userRole == "super_admin"
+
+    if (showDeleteDialog) {
+        AlertDialog(
+            onDismissRequest = { showDeleteDialog = false },
+            title = { Text("确认删除") },
+            text = { Text("确定要删除此帖子吗？此操作不可撤销，且会向发帖人发送通知。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    performDelete(
+                        context = context,
+                        post = post,
+                        scope = scope,
+                        userPreferences = userPreferences,
+                        onSuccess = {
+                            showDeleteDialog = false
+                            onDeleteSuccess()
+                        }
+                    )
+                }) { Text("确认删除", color = Color.Red) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteDialog = false }) { Text("取消") }
+            }
+        )
+    }
 
     Card(
         colors = CardDefaults.cardColors(containerColor = Color.White),
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 8.dp, vertical = 4.dp)
-            .clickable(onClick = onClick), // 点击卡片空白处跳转详情
+            .clickable(onClick = onClick),
         elevation = CardDefaults.cardElevation(2.dp)
     ) {
         Column(modifier = Modifier.padding(12.dp)) {
             // --- 头部 ---
             Row(verticalAlignment = Alignment.CenterVertically) {
-                AvatarImage(path = post.avatar, modifier = Modifier.size(40.dp))
+                // 【修复核心点】：绑定了点击事件，可以跳主页了！
+                AvatarImage(
+                    path = post.avatar,
+                    modifier = Modifier.size(40.dp).clickable { onUserClick(post.userId) }
+                )
                 Spacer(modifier = Modifier.width(8.dp))
                 Column {
                     Text(post.username ?: "未知用户", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                     Text(post.createTime?.replace("T", " ")?.substringBefore(".") ?: "", color = Color.Gray, fontSize = 12.sp)
+                }
+
+                Spacer(modifier = Modifier.weight(1f))
+
+                if (isAdmin) {
+                    TextButton(
+                        onClick = { showDeleteDialog = true },
+                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                        modifier = Modifier.height(32.dp)
+                    ) {
+                        Text(
+                            text = "删除",
+                            color = Color.Red,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
                 }
             }
 
@@ -760,7 +873,6 @@ fun PostCard(
             Text(post.title ?: "无标题", fontWeight = FontWeight.Bold, fontSize = 16.sp)
             Text(post.content ?: "暂无内容", fontSize = 14.sp, maxLines = 3, overflow = TextOverflow.Ellipsis, color = Color.DarkGray)
 
-            // --- 图片 ---
             if (!post.imgUrls.isNullOrEmpty()) {
                 Spacer(modifier = Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -771,7 +883,6 @@ fun PostCard(
                             modifier = Modifier
                                 .size(100.dp)
                                 .clip(RoundedCornerShape(4.dp))
-                                // 【关键修改】添加 clickable，拦截点击事件，打开大图
                                 .clickable { clickedImageUrl = url },
                             contentScale = ContentScale.Crop
                         )
@@ -779,7 +890,6 @@ fun PostCard(
                 }
             }
 
-            // --- 标签 ---
             if (!post.tags.isNullOrEmpty()) {
                 Spacer(modifier = Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -795,7 +905,6 @@ fun PostCard(
             HorizontalDivider(color = Color.LightGray.copy(alpha = 0.3f))
             Spacer(modifier = Modifier.height(8.dp))
 
-            // --- 底部互动栏 ---
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceAround
@@ -822,26 +931,22 @@ fun PostCard(
         }
     }
 
-    // ==========================================
-    // 【新增】全屏大图查看器 Dialog
-    // ==========================================
     if (clickedImageUrl != null) {
         Dialog(
             onDismissRequest = { clickedImageUrl = null },
             properties = DialogProperties(
-                usePlatformDefaultWidth = false, // 解除 Dialog 的默认宽度限制，允许全屏
-                dismissOnBackPress = true,       // 允许返回键关闭
-                dismissOnClickOutside = true     // 允许点击弹窗外关闭
+                usePlatformDefaultWidth = false,
+                dismissOnBackPress = true,
+                dismissOnClickOutside = true
             )
         ) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Black) // 黑底色沉浸式体验
-                    .clickable { clickedImageUrl = null }, // 点击黑底任何地方都可以关闭
+                    .background(Color.Black)
+                    .clickable { clickedImageUrl = null },
                 contentAlignment = Alignment.Center
             ) {
-                // 显示完整图片，按比例缩放以适应屏幕
                 AsyncImage(
                     model = clickedImageUrl,
                     contentDescription = "查看大图",
@@ -849,7 +954,6 @@ fun PostCard(
                     contentScale = ContentScale.Fit
                 )
 
-                // 右上角提供一个直观的关闭按钮
                 IconButton(
                     onClick = { clickedImageUrl = null },
                     modifier = Modifier
@@ -888,17 +992,27 @@ fun CommunityMineContent(
     userId: Int,
     userPreferences: UserPreferences,
     onNavigateToMyCollection: () -> Unit,
-    onPostClick: (Int) -> Unit
+    onPostClick: (Int) -> Unit,
+    onUserClick: (Int) -> Unit
 ) {
     var myPosts by remember { mutableStateOf<List<CommunityPostItem>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
+
+    // 控制关注列表弹窗显示的状态
+    var showFollowList by remember { mutableStateOf(false) }
+
+    // 【新增】：平滑过渡的背景模糊动画 (300毫秒渐变)
+    val blurRadius by animateDpAsState(
+        targetValue = if (showFollowList) 12.dp else 0.dp,
+        animationSpec = tween(durationMillis = 300),
+        label = "blurAnimation"
+    )
 
     // 统计数据
     var postCount by remember { mutableIntStateOf(0) }
     var likeCount by remember { mutableIntStateOf(0) }
     var fansCount by remember { mutableIntStateOf(0) }
     val context = LocalContext.current
-
     val nickname = remember { userPreferences.getNicknameOrGenerate() }
     val avatarPath = remember { userPreferences.avatarPath }
     val scope = rememberCoroutineScope()
@@ -922,111 +1036,149 @@ fun CommunityMineContent(
         }
     }
 
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(bottom = 80.dp)
-    ) {
-        item {
-            Card(
-                modifier = Modifier.fillMaxWidth().padding(16.dp),
-                colors = CardDefaults.cardColors(containerColor = Color.White),
-                elevation = CardDefaults.cardElevation(2.dp)
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
+    Box(modifier = Modifier.fillMaxSize()) {
+
+        // --- 第一层：原有的主页面 ---
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                // 【修改】：使用动画计算出的模糊半径
+                .then(if (blurRadius > 0.dp) Modifier.blur(blurRadius) else Modifier),
+            contentPadding = PaddingValues(bottom = 80.dp)
+        ) {
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color.White),
+                    elevation = CardDefaults.cardElevation(2.dp)
                 ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.fillMaxWidth()
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        AvatarImage(path = avatarPath, modifier = Modifier.size(64.dp))
-                        Spacer(modifier = Modifier.width(16.dp))
-                        Column {
-                            Text(text = nickname, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                            Text(text = "UID: $userId", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
-                        }
-                    }
-                    Spacer(modifier = Modifier.height(24.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceAround
-                    ) {
-                        StatItem(count = postCount, label = "帖子")
-                        StatItem(count = likeCount, label = "获赞")
-                        StatItem(count = fansCount, label = "粉丝")
-                    }
-                }
-            }
-        }
-
-        // 我的收藏入口 - 添加点击事件
-        item {
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp)
-                    // 【修改】添加跳转回调
-                    .clickable { onNavigateToMyCollection() },
-                colors = CardDefaults.cardColors(containerColor = Color.White),
-                shape = RoundedCornerShape(8.dp)
-            ) {
-                Row(
-                    modifier = Modifier.padding(16.dp).fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(Icons.Outlined.Star, null, tint = Color(0xFFFFC107))
-                    Spacer(modifier = Modifier.width(12.dp))
-                    Text("我的收藏", fontSize = 16.sp, fontWeight = FontWeight.Medium)
-                    Spacer(modifier = Modifier.weight(1f))
-                    Icon(Icons.Default.KeyboardArrowRight, null, tint = Color.Gray)
-                }
-            }
-            Spacer(modifier = Modifier.height(16.dp))
-        }
-
-        item {
-            Text(
-                text = "我的帖子",
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                color = Color.Gray
-            )
-        }
-
-        if (isLoading) {
-            item { Box(modifier = Modifier.fillMaxWidth().height(100.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() } }
-        } else if (myPosts.isEmpty()) {
-            item { Box(modifier = Modifier.fillMaxWidth().height(100.dp), contentAlignment = Alignment.Center) { Text("暂无发布内容", color = Color.Gray) } }
-        } else {
-            // 我的帖子列表也支持收藏/取消收藏
-            items(myPosts, key = { it.postId }) { post ->
-                PostCard(
-                    post = post,
-                    onFavoriteToggle = { targetPost ->
-                        // 更新逻辑：只更新状态，不移除帖子（因为这是我的发布列表）
-                        val newIsFavorite = if (targetPost.isFavorite == 1) 0 else 1
-                        val newFavCount = if (newIsFavorite == 1) targetPost.favoriteNum + 1 else targetPost.favoriteNum - 1
-
-                        myPosts = myPosts.map { if (it.postId == targetPost.postId) it.copy(isFavorite = newIsFavorite, favoriteNum = newFavCount) else it }
-
-                        scope.launch {
-                            val success = togglePostFavorite(targetPost, userPreferences)
-                            if (!success) {
-                                myPosts = myPosts.map { if (it.postId == targetPost.postId) targetPost else it }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            AvatarImage(path = avatarPath, modifier = Modifier.size(64.dp))
+                            Spacer(modifier = Modifier.width(16.dp))
+                            Column {
+                                Text(text = nickname, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                                Text(text = "UID: $userId", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
                             }
                         }
-                    },onLikeToggle = { likePost ->
-                        Toast.makeText(context, "请在社区主页进行点赞操作", Toast.LENGTH_SHORT).show()
-                    },
-                    onClick = { onPostClick(post.postId) }
+                        Spacer(modifier = Modifier.height(24.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceAround
+                        ) {
+                            StatItem(count = postCount, label = "帖子")
+                            StatItem(count = likeCount, label = "获赞")
+                            StatItem(count = fansCount, label = "粉丝")
+                        }
+                    }
+                }
+            }
+
+            // 功能入口区
+            item {
+                Column(Modifier.padding(horizontal = 16.dp)) {
+                    // 我的收藏入口
+                    Card(
+                        modifier = Modifier.fillMaxWidth().clickable { onNavigateToMyCollection() },
+                        colors = CardDefaults.cardColors(containerColor = Color.White),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(16.dp).fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Outlined.Star, null, tint = Color(0xFFFFC107))
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Text("我的收藏", fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                            Spacer(modifier = Modifier.weight(1f))
+                            Icon(Icons.Default.KeyboardArrowRight, null, tint = Color.Gray)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // 关注列表入口
+                    Card(
+                        modifier = Modifier.fillMaxWidth().clickable { showFollowList = true },
+                        colors = CardDefaults.cardColors(containerColor = Color.White),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(16.dp).fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.FavoriteBorder, null, tint = Color(0xFFE91E63))
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Text("关注列表", fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                            Spacer(modifier = Modifier.weight(1f))
+                            Icon(Icons.Default.KeyboardArrowRight, null, tint = Color.Gray)
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+            }
+
+            item {
+                Text(
+                    text = "我的帖子",
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.Gray
+                )
+            }
+
+            if (isLoading) {
+                item { Box(modifier = Modifier.fillMaxWidth().height(100.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() } }
+            } else if (myPosts.isEmpty()) {
+                item { Box(modifier = Modifier.fillMaxWidth().height(100.dp), contentAlignment = Alignment.Center) { Text("暂无发布内容", color = Color.Gray) } }
+            } else {
+                items(myPosts, key = { it.postId }) { post ->
+                    PostCard(
+                        post = post,
+                        onDeleteSuccess = { scope.launch { /* 刷新逻辑 */ } },
+                        onFavoriteToggle = { /* 收藏逻辑 */ },
+                        onLikeToggle = { Toast.makeText(context, "请在社区主页进行点赞操作", Toast.LENGTH_SHORT).show() },
+                        onUserClick = onUserClick,
+                        onClick = { onPostClick(post.postId) }
+                    )
+                }
+            }
+        }
+
+        // --- 第二层：纯净背景覆盖层 ---
+        // 【新增】：使用 AnimatedVisibility 包裹弹窗，增加渐显和从中间缩放的效果
+        AnimatedVisibility(
+            visible = showFollowList,
+            enter = fadeIn(tween(300)) + scaleIn(tween(300), initialScale = 0.8f),
+            exit = fadeOut(tween(300)) + scaleOut(tween(300), targetScale = 0.8f),
+            modifier = Modifier.fillMaxSize()
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Transparent)
+                    .clickable(
+                        interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                        indication = null
+                    ) { showFollowList = false },
+                contentAlignment = Alignment.Center
+            ) {
+                FollowListOverlay(
+                    userPreferences = userPreferences,
+                    onClose = { showFollowList = false },
+                    onUserClick = onUserClick
                 )
             }
         }
     }
 }
-
 @Composable
 fun StatItem(count: Int, label: String) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -1336,9 +1488,12 @@ fun CommentItemView(
     comment: PostComment,
     currentReplyTarget: ReplyTarget,
     inputText: String,
+    hasDeletePermission: Boolean,
     onInputTextChange: (String) -> Unit,
     onReplyClick: (ReplyTarget) -> Unit,
-    onSubmit: () -> Unit
+    onUserClick: (Int) -> Unit,
+    onSubmit: () -> Unit,
+    onDeleteClick: (commentId: Int?, replyId: Int?) -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -1348,21 +1503,39 @@ fun CommentItemView(
     ) {
         // 主评论区
         Row(verticalAlignment = Alignment.Top) {
-            AvatarImage(path = comment.avatar, modifier = Modifier.size(36.dp))
+            AvatarImage(
+                path = comment.avatar,
+                modifier = Modifier.size(36.dp).clickable { onUserClick(comment.userId) }
+            )
             Spacer(modifier = Modifier.width(12.dp))
 
             Column(modifier = Modifier.weight(1f)) {
-                // 昵称和时间
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(comment.username, fontWeight = FontWeight.Bold, color = Color(0xFF333333), fontSize = 14.sp)
+                // 【修改 3】：评论者名字截断
+                val commentDisplayName = if (comment.username.length > 7) comment.username.take(7) + "..." else comment.username
+
+                // 昵称和时间行 (【修改 2】：已经移除了右上角的删除按钮)
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Text(commentDisplayName, fontWeight = FontWeight.Bold, color = Color(0xFF333333), fontSize = 14.sp)
                     Text(comment.createTime.replace("T", " ").substringBefore("."), color = Color.Gray, fontSize = 12.sp)
                 }
                 Spacer(modifier = Modifier.height(4.dp))
                 // 评论内容
                 Text(comment.content, fontSize = 15.sp, color = Color.Black, lineHeight = 22.sp)
 
-                // 交互行 (回复按钮)
-                Row(modifier = Modifier.fillMaxWidth().padding(top = 4.dp), horizontalArrangement = Arrangement.End) {
+                // 交互行 (回复按钮 和 删除按钮)
+                Row(modifier = Modifier.fillMaxWidth().padding(top = 4.dp), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+                    // 【修改 2】：主评论的删除按钮移到了下面
+                    if (hasDeletePermission) {
+                        Text(
+                            text = "删除",
+                            color = Color.Red,
+                            fontSize = 13.sp,
+                            modifier = Modifier
+                                .clickable { onDeleteClick(comment.commentId, null) }
+                                .padding(4.dp)
+                        )
+                        Spacer(modifier = Modifier.width(16.dp))
+                    }
                     Text(
                         text = "回复",
                         color = Color(0xFF2196F3),
@@ -1394,30 +1567,47 @@ fun CommentItemView(
                         comment.replies.forEach { reply ->
                             Column(modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                    AvatarImage(path = reply.fromUserAvatar, modifier = Modifier.size(24.dp))
+                                    AvatarImage(
+                                        path = reply.fromUserAvatar,
+                                        modifier = Modifier.size(24.dp).clickable { onUserClick(reply.fromUserId) }
+                                    )
                                     Spacer(modifier = Modifier.width(8.dp))
 
-                                    // 格式: A 回复 B
-                                    Text(reply.fromUserName, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF555555))
+                                    // 【修改 3】：回复者和被回复者名字截断
+                                    val fromDisplayName = if (reply.fromUserName.length > 7) reply.fromUserName.take(7) + "..." else reply.fromUserName
+                                    val toDisplayName = if (reply.toUserName.length > 7) reply.toUserName.take(7) + "..." else reply.toUserName
 
-                                    // 只有当回复的对象不是层主时，才显示 "回复 B" 避免啰嗦
-                                    if (reply.toUserName != comment.username) {
+                                    Text(fromDisplayName, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF555555))
+
+                                    if (true) {
                                         Text(" 回复 ", fontSize = 13.sp, color = Color.Gray)
-                                        Text(reply.toUserName, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF555555))
+                                        Text(toDisplayName, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF555555))
                                     }
 
+                                    // 【修改 2】：已经移除了右上角的嵌套回复删除按钮
                                     Spacer(modifier = Modifier.weight(1f))
                                     Text(reply.createTime.replace("T", " ").substringBefore("."), color = Color.Gray, fontSize = 11.sp)
                                 }
 
                                 Text(
-                                    // 后端的内容可能自带了 @xxx，UI可以根据需求处理，这里直接展示
                                     text = reply.content,
                                     fontSize = 14.sp,
                                     modifier = Modifier.padding(start = 32.dp, top = 4.dp)
                                 )
 
-                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+                                    // 【修改 2】：子回复的删除按钮移到了下面
+                                    if (hasDeletePermission) {
+                                        Text(
+                                            text = "删除",
+                                            color = Color.Red,
+                                            fontSize = 12.sp,
+                                            modifier = Modifier
+                                                .clickable { onDeleteClick(null, reply.replyId) }
+                                                .padding(4.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(16.dp))
+                                    }
                                     Text(
                                         text = "回复", color = Color(0xFF2196F3), fontSize = 12.sp,
                                         modifier = Modifier.clickable {
@@ -1440,6 +1630,220 @@ fun CommentItemView(
                 }
             }
         }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun OtherUserProfileScreen(
+    targetUserId: Int,
+    userPreferences: UserPreferences,
+    onBack: () -> Unit
+) {
+    var profile by remember { mutableStateOf<UserProfile?>(null) }
+    var isLoading by remember { mutableStateOf(true) }
+    var isFollowing by remember { mutableStateOf(false) }
+    var isActionLoading by remember { mutableStateOf(false) } // 防止重复点击
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val token = userPreferences.token?.let { if (it.startsWith("Bearer ")) it else "Bearer $it" } ?: ""
+
+    // 加载资料
+    LaunchedEffect(targetUserId) {
+        try {
+            // 根据你的 ApiService 定义，这里传入 UserProfileRequest
+            val res = NetworkClient.instance.getUserProfile(token, targetUserId)
+            if (res.isSuccessful && res.body()?.code == 200) {
+                Log.d("followDebug","${res.body()?.data}")
+                profile = res.body()?.data
+                isFollowing = res.body()?.data?.isFollow ?: false
+            }
+        } catch (e: Exception) {
+            Toast.makeText(context, "加载资料失败", Toast.LENGTH_SHORT).show()
+        } finally {
+            isLoading = false
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("用户主页") },
+                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "返回") } },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.White)
+            )
+        },
+        // 增加灰色背景，让白色的卡片立体感更强
+        containerColor = Color(0xFFF5F5F5)
+    ) { padding ->
+        if (isLoading) {
+            Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator()
+            }
+        } else profile?.let { data ->
+            Column(
+                modifier = Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState())
+            ) {
+                // ================= 1. 头部资料卡片 =================
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color.White),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                ) {
+                    // 【关键修复】：加上 fillMaxWidth() 并设置水平居中
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(20.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        AvatarImage(path = data.userInfoVO.avatar, modifier = Modifier.size(80.dp).clip(CircleShape))
+                        Spacer(Modifier.height(12.dp))
+                        Text(data.userInfoVO.username, fontWeight = FontWeight.Bold, fontSize = 20.sp)
+
+                        // 角色标签
+                        Surface(
+                            color = if (data.role == "admin") Color(0xFFFFEBEE) else Color(0xFFE3F2FD),
+                            shape = RoundedCornerShape(4.dp),
+                            modifier = Modifier.padding(vertical = 8.dp)
+                        ) {
+                            Text(
+                                if (data.role == "admin") "管理员" else "普通用户",
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                                color = if (data.role == "admin") Color.Red else Color(0xFF1976D2),
+                                fontSize = 12.sp
+                            )
+                        }
+
+                        Text(data.userInfoVO.userSignature ?: "这个人很懒，什么都没写~", color = Color.Gray, fontSize = 14.sp)
+
+                        Spacer(Modifier.height(16.dp))
+
+                        // 关注按钮逻辑 (不能关注自己)
+                        if (data.userInfoVO.userId.toInt() != userPreferences.userId) {
+                            Button(
+                                onClick = {
+                                    if (isActionLoading) return@Button
+                                    isActionLoading = true
+                                    scope.launch {
+                                        // ⚠️ 注意：请确保 FollowUserRequest 里的参数名（如 followeeId）与你 Apifox 接口文档中要求的一模一样
+                                        try {
+                                            val res = if (isFollowing) {
+                                                NetworkClient.instance.cancelFollowUser(token, targetUserId)
+                                            } else {
+                                                NetworkClient.instance.followUser(token, targetUserId)
+                                            }
+
+                                            // 打印出后端返回的真实状态码和提示信息
+                                            Log.d("followDebug", "真实请求结果 -> Code: ${res.body()?.code}, Msg: ${res.body()?.msg}")
+
+                                            // 【核心修复】：必须确保网络请求成功，且业务状态码 code 为 200 才算真正成功
+                                            if (res.isSuccessful && res.body()?.code == 200) {
+                                                isFollowing = !isFollowing
+                                                Toast.makeText(context, if (isFollowing) "关注成功" else "已取消关注", Toast.LENGTH_SHORT).show()
+                                            } else {
+                                                // 如果后端校验失败，将后端的报错信息（msg）直接显示在屏幕上
+                                                val errorMsg = res.body()?.msg ?: "未知错误"
+                                                Toast.makeText(context, "操作失败: $errorMsg", Toast.LENGTH_SHORT).show()
+
+                                                // 强制将按钮状态回滚/保持为原来的状态（防止UI欺骗）
+                                                Log.e("followDebug", "后端拒绝了请求，原因: $errorMsg")
+                                            }
+                                        } catch (e: Exception) {
+                                            e.printStackTrace()
+                                            Toast.makeText(context, "操作异常，请检查网络: ${e.message}", Toast.LENGTH_SHORT).show()
+                                        } finally {
+                                            isActionLoading = false
+                                        }
+                                    }
+                                },
+                                shape = RoundedCornerShape(20.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = if (isFollowing) Color.LightGray else Color(0xFF2196F3)
+                                )
+                            ) {
+                                if (isActionLoading) {
+                                    CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White)
+                                } else {
+                                    Text(
+                                        text = if (isFollowing) "取消关注" else "+ 关注",
+                                        color = if (isFollowing) Color.DarkGray else Color.White
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ================= 2. 统计数据模块 =================
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    StatBox("帖子", data.communityStatisticDto.postNum, Modifier.weight(1f))
+                    StatBox("获赞", data.communityStatisticDto.getLikeNum, Modifier.weight(1f))
+                    StatBox("粉丝", data.communityStatisticDto.fansNum, Modifier.weight(1f))
+                }
+
+                // ================= 3. 志愿者资料模块 =================
+                // 只有当 volunteerDataVO 不为空时才显示这块区域
+                data.volunteerDataVO?.let { vol ->
+                    Spacer(Modifier.height(16.dp))
+                    Text("志愿者信息", Modifier.padding(horizontal = 16.dp), fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color.White),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                    ) {
+                        Column(Modifier.padding(16.dp)) {
+                            InfoRow("年级", vol.grade)
+                            // 将完成率转为百分比展示，例如 0.1429 -> 14%
+                            InfoRow("完成率", "${(vol.finishRate * 100).toInt()}%")
+                            InfoRow("联系方式", vol.contactNumber)
+                        }
+                    }
+                }
+
+                // ================= 4. 底部其他信息 =================
+                Spacer(Modifier.height(16.dp))
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                    Text("最后登录: ${data.lastLoginTime ?: "未知"}", color = Color.Gray, fontSize = 12.sp)
+                    Spacer(Modifier.height(4.dp))
+                    Text("主页访问量: ${data.visitedNum}", color = Color.Gray, fontSize = 12.sp)
+                }
+
+                Spacer(Modifier.height(40.dp)) // 页面底部留白
+            }
+        }
+    }
+}
+
+// ============== UI 辅助组件 ==============
+@Composable
+fun StatBox(label: String, count: Int, modifier: Modifier = Modifier) {
+    Card(
+        modifier = modifier,
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(vertical = 16.dp, horizontal = 8.dp).fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text("$count", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = Color(0xFF333333))
+            Spacer(Modifier.height(4.dp))
+            Text(label, fontSize = 13.sp, color = Color.Gray)
+        }
+    }
+}
+
+@Composable
+fun InfoRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(label, color = Color.Gray, fontSize = 15.sp)
+        Text(value, fontWeight = FontWeight.Medium, fontSize = 15.sp, color = Color(0xFF333333))
     }
 }
 
@@ -1473,6 +1877,159 @@ fun InlineReplyInput(
                     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 0.dp)
                 ) {
                     Text("发表", fontSize = 13.sp)
+                }
+            }
+        }
+    }
+}
+
+// 3. 将你的代码放在文件底部（或者 Composable 外部）
+// 3. 将你的代码放在文件底部（或者 Composable 外部）
+private fun performDelete(
+    context: Context, // 显式传入 context 以解决 Intent 和 Toast 报错
+    post: CommunityPostItem,
+    scope: CoroutineScope,
+    userPreferences: UserPreferences, // 使用已有的 userPreferences 获取 token
+    onSuccess: () -> Unit
+) {
+    // 获取 token 并确保格式正确
+    val token = userPreferences.token?.let {
+        if (it.startsWith("Bearer ")) it else "Bearer $it"
+    } ?: ""
+
+    scope.launch {
+        try {
+            // 步骤 1: 调用删帖接口
+            val deleteRes = NetworkClient.instance.deletePost(token, post.postId)
+
+            if (deleteRes.isSuccessful) {
+                // 步骤 2: 发送通知（作为次要操作，不影响跳转）
+                launch {
+                    try {
+                        NetworkClient.instance.sendDeleteNotification(
+                            token,
+                            SendDeleteNotifyRequest(
+                                title = "帖子删除通知",
+                                content = "您的帖子《${post.title}》因违反社区规定已被管理员删除。",
+                                receiverId = post.userId
+                            )
+                        )
+                    } catch (e: Exception) {
+                        Log.e("PostDelete", "发送通知失败: ${e.message}")
+                    }
+                }
+
+                // 切换到主线程执行 UI 操作和跳转
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    Toast.makeText(context, "帖子已成功删除", Toast.LENGTH_SHORT).show()
+
+                    // 步骤 3: 这里的 onSuccess() 在调用处应该指向具体的返回/刷新逻辑
+                    // 比如在 Composable 中传入的是 { onBack() }
+                    onSuccess()
+                }
+            } else {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    Toast.makeText(context, "删除失败: ${deleteRes.message()}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("PostDelete", "删除请求异常: ${e.message}")
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                Toast.makeText(context, "网络错误，删除失败", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun FollowListOverlay(
+    userPreferences: UserPreferences,
+    onClose: () -> Unit,
+    onUserClick: (Int) -> Unit
+) {
+    var keyword by remember { mutableStateOf("") }
+    var users by remember { mutableStateOf<List<FollowUserItem>>(emptyList()) }
+    var isLoading by remember { mutableStateOf(true) }
+    val context = LocalContext.current
+    val token = userPreferences.token?.let { if (it.startsWith("Bearer ")) it else "Bearer $it" } ?: ""
+
+    // 当 keyword 改变时，延迟 500ms 后自动请求接口 (防抖设计)
+    LaunchedEffect(keyword) {
+        isLoading = true
+        kotlinx.coroutines.delay(500)
+        try {
+            val res = NetworkClient.instance.getFollowList(token, 1, 50, keyword, 1)
+            if (res.isSuccessful && res.body()?.code == 200) {
+                users = res.body()?.data?.list ?: emptyList()
+            }
+        } catch (e: Exception) {
+            Toast.makeText(context, "获取关注列表失败", Toast.LENGTH_SHORT).show()
+        } finally {
+            isLoading = false
+        }
+    }
+
+    // 主卡片 UI
+    Card(
+        modifier = Modifier
+            .fillMaxWidth(0.85f) // 占据屏幕 85% 宽度
+            .fillMaxHeight(0.7f) // 占据屏幕 70% 高度
+            // 消费掉卡片内部的点击事件，防止点到卡片上导致弹窗关闭
+            .clickable(interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }, indication = null) {},
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        elevation = CardDefaults.cardElevation(8.dp)
+    ) {
+        Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+            // 顶部标题和关闭按钮
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("我的关注", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                IconButton(onClick = onClose) { Icon(Icons.Default.Close, "关闭") }
+            }
+
+            // 搜索框
+            OutlinedTextField(
+                value = keyword,
+                onValueChange = { keyword = it },
+                placeholder = { Text("搜索用户名...", color = Color.Gray, fontSize = 14.sp) },
+                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                shape = RoundedCornerShape(20.dp),
+                singleLine = true,
+                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = Color.Gray) },
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor = Color(0xFFF5F5F5),
+                    unfocusedContainerColor = Color(0xFFF5F5F5),
+                    focusedIndicatorColor = Color.Transparent,
+                    unfocusedIndicatorColor = Color.Transparent
+                )
+            )
+
+            // 用户列表展示
+            if (isLoading) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+            } else if (users.isEmpty()) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("未找到相关用户", color = Color.Gray) }
+            } else {
+                LazyColumn(modifier = Modifier.fillMaxSize()) {
+                    items(users, key = { it.userId }) { user ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 8.dp)
+                                .clickable {
+                                    onClose() // 先关闭弹窗
+                                    onUserClick(user.userId) // 跳转到主页
+                                },
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            AvatarImage(path = user.avatar ?: "", modifier = Modifier.size(40.dp).clip(CircleShape))
+                            Spacer(Modifier.width(12.dp))
+                            Column {
+                                Text(user.username, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                                Text(user.userSignature ?: "这个人很懒，什么都没写~", color = Color.Gray, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                    }
                 }
             }
         }

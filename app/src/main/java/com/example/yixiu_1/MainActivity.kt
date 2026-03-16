@@ -6,6 +6,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.*
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Image
@@ -72,6 +73,11 @@ import com.example.yixiu_1.data.UserPreferences
 import com.example.yixiu_1.network.EmailRegisterOrLoginRequest
 import com.example.yixiu_1.network.RepairHistoryItem
 import com.example.yixiu_1.network.RepairTaskRequest
+import com.example.yixiu_1.ui.KnowledgeScreen
+
+
+import android.content.Context
+import androidx.compose.foundation.BorderStroke
 
 // ==================== 必须添加的引用 ====================
 import com.example.yixiu_1.network.NetworkClient
@@ -79,12 +85,16 @@ import com.example.yixiu_1.network.RepairTaskItem
 // =======================================================
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.CancellationException
+
 
 import com.example.yixiu_1.ui.ProfileScreen
 import com.example.yixiu_1.ui.theme.YIXIU_1Theme
 import com.example.yixiu_1.ui.CommunityScreen
 import com.example.yixiu_1.ui.CreatePostScreen
 import com.example.yixiu_1.ui.MyCollectionScreen
+import com.example.yixiu_1.ui.MyTasksScreen
+
 import com.example.yixiu_1.network.CommunityPostItem
 
 
@@ -97,12 +107,24 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import com.example.yixiu_1.network.*
 import com.example.yixiu_1.ui.EditProfileScreen
+import com.example.yixiu_1.ui.MemberManagementScreen
 import com.example.yixiu_1.ui.PostDetailScreen
-
+import com.example.yixiu_1.utils.ChineseSegmenter
+import com.example.yixiu_1.utils.TfIdfMatcher
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlin.text.toIntOrNull
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearOutSlowInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.ui.draw.BlurredEdgeTreatment
+import com.example.yixiu_1.ui.OtherUserProfileScreen
+import SkeletonHistoryCard
+import androidx.compose.material.icons.outlined.StarBorder
+
 
 val pageSize = AppConstants.DEFAULT_PAGE_SIZE
 val pageNum = AppConstants.INITIAL_PAGE_NUM
@@ -156,7 +178,9 @@ sealed class Screen {
     object MyCollection : Screen()
     object CreatePost : Screen()
     object EditProfile : Screen()
+    object KnowledgeManagement : Screen()
     data class PostDetail(val postId: Int) : Screen()
+    data class OtherUserProfile(val userId: Int) : Screen()
 }
 
 // ===================== 3. 核心导航与动画逻辑 =====================
@@ -390,62 +414,281 @@ private fun AppContentInternal(
     val scrollState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val userPreferences = UserPreferences(LocalContext.current)
+    //控制模糊效果
+    val blurRadius = remember { Animatable(0f) }
+
     var isApiLoading by remember { mutableStateOf(false) }
+    var conversationId by remember { mutableIntStateOf(19) } // 初始 ID
+    var isPendingNewSession by remember { mutableStateOf(false) }
+    // --- 状态定义 ---
+    var showHistoryByClock by remember { mutableStateOf(false) } // 控制历史小窗显示
+    var sessionList by remember { mutableStateOf(listOf<ChatSessionItem>()) } // 存储从后端获取的会话列表
+
+    // 【新增】：控制侧边悬浮按钮展开/收起的状态（默认隐藏）
+    var isFabExpanded by remember { mutableStateOf(false) }
+
+    // 正确写法
+    var localKnowledgeList by remember { mutableStateOf<List<KnowledgeItem>>(emptyList()) }
+
+    // 2. 监听页面状态的变化 (如果用 NavHost，传入 navController.currentDestination?.route)
+    LaunchedEffect(currentScreen::class) {
+        // 当 currentScreen 发生改变时，触发以下动画：
+        // 瞬间将模糊度拉高到 16f
+        blurRadius.animateTo(
+            targetValue = 12f,
+            animationSpec = tween(
+                durationMillis = 150, // 用 150 毫秒快速但平滑地变模糊
+                easing = FastOutLinearInEasing // 建议用这种加速曲线，配合页面退出的感觉
+            )
+        )
+        // 然后在 350 毫秒内，平滑过渡回 0f (清晰)
+        blurRadius.animateTo(
+            targetValue = 0f,
+            animationSpec = tween(
+                durationMillis = 400,
+                easing = LinearOutSlowInEasing // 使用缓出动画，让清晰的过程更自然
+            )
+        )
+    }
+
+
+    // --- A. 新建聊天按钮 ---
+    SmallFloatingActionButton(
+        onClick = {
+            // 1. 检查当前对话是否为空（防止重复创建空会话）
+            if (chatMessages.isEmpty()) {
+                Toast.makeText(context, "当前已经是新对话", Toast.LENGTH_SHORT).show()
+                return@SmallFloatingActionButton
+            }
+
+            // 2. 准备新建逻辑：清空 UI，标记待定状态
+            chatMessages = emptyList()
+            isPendingNewSession = true
+            Toast.makeText(context, "已准备好，发送消息即刻开启新会话", Toast.LENGTH_SHORT).show()
+        }
+    ) { Icon(Icons.Default.Add, contentDescription = "New Chat") }
+
+    // 1. 修改 loadHistorySessions，增加一个加载完成的回调 (onLoaded)
+    fun loadHistorySessions(userToken: String, apiService: DoubaoApiService, onLoaded: (Int) -> Unit = {}) {
+        scope.launch {
+            try {
+                val response = apiService.getChatSessions(userToken, pageNum = 1, pageSize = 20)
+                if (response.isSuccessful) {
+                    val list = response.body()?.data?.list ?: emptyList()
+                    sessionList = list
+                    // 拿到真实数据后，找出最大的 ID 并传给回调
+                    val maxId = list.maxByOrNull { it.conversationId }?.conversationId ?: 0
+                    onLoaded(maxId)
+                } else {
+                    onLoaded(0) // 如果失败了，默认从 0 开始
+                }
+            } catch (e: Exception) {
+                Log.e("ChatDebug", "获取历史失败: ${e.message}")
+                onLoaded(0)
+            }
+        }
+    }
+
+    fun loadChatHistory(id: Int) {
+        val token = userPreferences.token ?: ""
+        scope.launch {
+            try {
+                val response = DoubaoApiClient.instance.getChatHistory(token, id, 1, 50)
+                if (response.isSuccessful) {
+                    // 将后端返回的历史消息转换为 UI 显示的列表
+                    chatMessages = response.body()?.data?.list?.map {
+                        ChatMessage(content = it.content, role = if (it.role == "user") Role.USER else Role.ASSISTANT)
+                    }?: emptyList()
+                }
+            } catch (e: Exception) {
+                Log.e("ChatDebug", "切换对话失败: ${e.message}")
+            }
+        }
+    }
+
+    // 2. 提前声明 startNewChat 函数 (挪到这里，解决编译顺序问题)
+    fun startNewChat(
+        currentId: Int,
+        token: String,
+        apiService: DoubaoApiService,
+        onFound: (Int) -> Unit
+    ) {
+        scope.launch {
+            var nextId = currentId
+            var found = false
+            while (!found) {
+                nextId++
+                try {
+                    val response = apiService.getChatHistory(token, nextId, 1, 1)
+                    if (response.isSuccessful) {
+                        val list = response.body()?.data?.list
+                        if (list.isNullOrEmpty()) found = true
+                    } else {
+                        found = true
+                    }
+                } catch (e: Exception) {
+                    found = true
+                }
+                if (nextId > currentId + 100) break
+            }
+            if (found) onFound(nextId)
+        }
+    }
+
+    // 3. 修改 LaunchedEffect，使用回调串联这两个操作
+    LaunchedEffect(Unit) {
+        val savedToken = userPreferences.token ?: ""
+        if (savedToken.isNotBlank()) {
+            NetworkClient.setToken(savedToken)
+
+            // 先加载历史列表，加载完成后，拿着真实的 maxId 去寻找新对话
+            loadHistorySessions(savedToken, DoubaoApiClient.instance) { realMaxId ->
+                startNewChat(
+                    currentId = realMaxId,
+                    token = savedToken,
+                    apiService = DoubaoApiClient.instance
+                ) { newId ->
+                    conversationId = newId
+                    chatMessages = emptyList()
+                    isPendingNewSession = true
+                    Log.d("ChatDebug", "已自动进入新会话 ID: $newId")
+                }
+            }
+        }
+    }
+
+
+
+
+    LaunchedEffect(Unit) {
+        try {
+            // 注意：这里需要根据你的 ApiService 实际路径来调用
+            val response = NetworkClient.instance.getKnowledgeList("${userPreferences.token}")
+            if (response.isSuccessful) {
+                localKnowledgeList = response.body()?.data ?: emptyList()
+                Log.d("ChatDebug", "知识库获取成功: ${localKnowledgeList.size} 条")
+            } else {
+                Log.e("ChatDebug", "接口报错: ${response.code()}")
+            }
+        } catch (e: Exception) {
+            Log.e("ChatDebug", "网络请求异常: ${e.message}")
+        }
+    }
+
 
     fun sendMessage() {
-        // 检查是否正在加载
-        if (isApiLoading) return  // 如果正在加载，直接返回，不执行发送
-
         val trimmedInput = inputText.trim()
         if (trimmedInput.isEmpty()) return
 
-        val userMessage = ChatMessage(
-            content = trimmedInput,
-            role = Role.USER
-        )
+        val userToken = userPreferences.token ?: ""
+        Log.d("ChatDebug", "--- Token 检查 ---")
+        Log.d("ChatDebug", "原始 Token 长度: ${userToken.length}")
+        Log.d("ChatDebug", "原始 Token 内容: |$userToken|") // 用竖线包围看是否有空格
+        val apiService = DoubaoApiClient.instance
+        val doubaoHelper = DoubaoApiHelper()
 
-        chatMessages = chatMessages + userMessage
+        // 1. UI 立即显示用户消息
+        chatMessages = chatMessages + ChatMessage(content = trimmedInput, role = Role.USER)
         inputText = ""
-
-        // 设置加载状态
         isApiLoading = true
 
+        // 统一在主作用域启动，确保顺序执行
         scope.launch {
             try {
-                val doubaoHelper = DoubaoApiHelper()
-                Log.d("DoubaoAPI", "准备发送请求: '$trimmedInput'")
+                var finalAiReply = ""
+                var isFromLocalKB = false
 
-                val result = doubaoHelper.sendTextMessage(trimmedInput)
+                // --- 步骤 1: 本地匹配 ---
+                if (localKnowledgeList.isNotEmpty()) {
+                    val queryTokens = ChineseSegmenter.tokenize(trimmedInput)
+                    val queryVector = TfIdfMatcher.getTermFrequency(queryTokens)
+                    var maxScore = 0.0
+                    var bestMatch: KnowledgeItem? = null
 
-                val assistantMessage = if (result.isSuccess) {
-                    val response = result.getOrNull()
-                    val content = try {
-                        val choice = response?.choices?.firstOrNull()
-                        val message = choice?.message
-                        message?.content?.toString() ?: "无法获取豆包回复"
-                    } catch (e: Exception) {
-                        Log.e("DoubaoAPI", "解析响应失败: ${e.message}", e)
-                        "解析回复时出错: ${e.message}"
+                    localKnowledgeList.forEach { item ->
+                        val itemTokens = ChineseSegmenter.tokenize(item.problem)
+                        val itemVector = TfIdfMatcher.getTermFrequency(itemTokens)
+                        val score = TfIdfMatcher.calculateCosineSimilarity(queryVector, itemVector)
+                        if (score > maxScore) {
+                            maxScore = score
+                            bestMatch = item
+                        }
                     }
 
-                    ChatMessage(content = content, role = Role.ASSISTANT)
-                } else {
-                    val exception = result.exceptionOrNull()
-                    Log.e("DoubaoAPI", "API调用失败: ${exception?.message}", exception)
-                    ChatMessage(content = "API调用失败: ${exception?.message}", role = Role.ASSISTANT)
+                    if (maxScore > 0.4 && bestMatch != null) {
+                        finalAiReply = bestMatch!!.solution
+                        isFromLocalKB = true
+                        Log.d("ChatDebug", "命中本地库: ${bestMatch!!.problem}")
+                    }
                 }
 
-                chatMessages = chatMessages + assistantMessage
+                // --- 步骤 2: 请求 AI (本地未命中时) ---
+                if (!isFromLocalKB) {
+                    val result = withContext(Dispatchers.IO) {
+                        doubaoHelper.sendTextMessageWithContext(conversationId, trimmedInput, userToken, apiService)
+                    }
+                    finalAiReply = if (result.isSuccess) {
+                        result.getOrNull()?.choices?.firstOrNull()?.message?.content?.toString() ?: ""
+                    } else {
+                        "网络异常，请稍后再试"
+                    }
+                }
+
+                if (finalAiReply.isEmpty()) finalAiReply = "暂无回复"
+
+                // --- 步骤 3: 更新 UI ---
+                chatMessages = chatMessages + ChatMessage(content = finalAiReply, role = Role.ASSISTANT)
+
+                // --- 步骤 4: 【核心修复】同步保存到后端 ---
+                // 使用 withContext 确保在后台执行，但逻辑上挂起等待完成
+                // 在 sendMessage 的 scope.launch 内部，AI 回复之后：
+                withContext(Dispatchers.IO) {
+                    val authHeader = userToken
+
+                    // 如果是新会话，我们需要在后端“激活”这个 Session
+                    if (isPendingNewSession) {
+                        val safeInput = if (trimmedInput.length > 8) trimmedInput.take(8) + "..." else trimmedInput
+
+                        // 注意：这里调用 addChatSession 应该确保后端能接受你预设的 conversationId
+                        // 或者，如果 addChatSession 会返回一个新的 ID，我们要以返回的为准
+                        val sessionRes = apiService.addChatSession(authHeader, safeInput)
+
+                        if (sessionRes.isSuccessful && sessionRes.body()?.data != null) {
+                            // 重要：同步后端生成的真实 ID
+                            conversationId = sessionRes.body()!!.data!!.conversationId
+                            isPendingNewSession = false
+                        }
+                    }
+
+                    // 只要有 ID，就保存。这样即便用户重进，第一段对话也会因为 ID 已经存入后端而出现在历史里。
+                    if (conversationId > 0) {
+                        apiService.saveChatMessage(authHeader, mapOf(
+                            "conversationId" to conversationId,
+                            "role" to "user",
+                            "question" to trimmedInput
+                        ))
+                        apiService.saveChatMessage(authHeader, mapOf(
+                            "conversationId" to conversationId,
+                            "role" to "assistant",
+                            "question" to finalAiReply
+                        ))
+
+                        // 保存完立即刷新列表，让历史记录显示出来
+                        loadHistorySessions(authHeader, apiService)
+                    }
+                }
+
             } catch (e: Exception) {
-                Log.e("DoubaoAPI", "发送消息时发生异常", e)
-                val errorMessage = ChatMessage(content = "网络错误: ${e.message}", role = Role.ASSISTANT)
-                chatMessages = chatMessages + errorMessage
+                Log.e("ChatDebug", "sendMessage 异常: ${e.message}")
             } finally {
-                // 确保无论成功或失败都解除加载状态
                 isApiLoading = false
             }
         }
     }
+
+    // 查找下一个可用的新对话 ID
+
 
     // 在 AppContentInternal 函数内部开头
     var messageCenterRefreshTrigger by remember { mutableIntStateOf(0) } // 【新增】定义刷新触发器
@@ -596,27 +839,28 @@ private fun AppContentInternal(
 
 
     Box(modifier = Modifier.fillMaxSize()) {
-        val blurRadius by animateDpAsState(
+        val backgroundBlur by animateDpAsState(
             targetValue = if (drawerState.isOpen) 16.dp else 3.dp,
             animationSpec = tween(300), label = "blur"
         )
-        val imageModifier = if (blurRadius > 0.dp) {
+        val imageModifier = if (backgroundBlur > 0.dp) {
             Modifier
                 .fillMaxSize()
-                .blur(radiusX = blurRadius, radiusY = blurRadius)
-        } else { Modifier.fillMaxSize() }
+                .blur(radiusX = backgroundBlur, radiusY = backgroundBlur)
+        } else {
+            Modifier.fillMaxSize()
+        }
 
         val backgroundImage = if (isAdmin) {
             painterResource(id = R.drawable.admin_background)
-        }else{
-                painterResource(id = R.drawable.bg_campus_repair)
-            }
-
+        } else {
+            painterResource(id = R.drawable.bg_campus_repair)
+        }
         Image(
             painter = backgroundImage,
             contentDescription = null,
-            modifier = imageModifier,
-            contentScale = ContentScale.Crop
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.fillMaxSize()
         )
 
         // 在 AppContentInternal 函数内的 ModalNavigationDrawer 中
@@ -627,23 +871,36 @@ private fun AppContentInternal(
                 ModalDrawerSheet(Modifier.fillMaxWidth(0.618f)) {
                     Spacer(Modifier.height(64.dp))
 
-                    // 通用导航项目 - 所有身份都可以看到
+                    // 1. 通用导航项目 (所有人可见)
                     NavigationDrawerItem(
                         label = { Text("主页") },
                         selected = currentScreen == Screen.Home,
-                        onClick = { scope.launch { drawerState.close() }; currentScreen = Screen.Home }
+                        onClick = {
+                            scope.launch { drawerState.close() }; currentScreen = Screen.Home
+                        }
                     )
 
                     NavigationDrawerItem(
                         label = { Text("消息中心") },
                         selected = currentScreen == Screen.MessageCenter,
-                        onClick = { scope.launch { drawerState.close() }; currentScreen = Screen.MessageCenter }
+                        onClick = {
+                            scope.launch { drawerState.close() }; currentScreen =
+                            Screen.MessageCenter
+                        }
+                    )
+
+                    NavigationDrawerItem(
+                        label = { Text("义修社区") },
+                        selected = currentScreen is Screen.Community,
+                        onClick = {
+                            scope.launch { drawerState.close() }; currentScreen = Screen.Community()
+                        }
                     )
 
                     HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
 
-                    // 动态侧边栏内容 - 根据身份显示不同功能
-                    // 学生/普通用户功能
+                    // 2. 义修服务 (仅学生/普通用户可见)
+                    // 逻辑：如果不是志愿者且不是管理员，则显示
                     if (!isVolunteer && !isAdmin) {
                         ExpandableNavigationItem(
                             label = "义修服务",
@@ -662,8 +919,9 @@ private fun AppContentInternal(
                         )
                     }
 
-                    // 志愿者功能
-                    if (isVolunteer) {
+                    // 3. 任务中心 (志愿者 OR 管理员可见)
+                    // 注意：我们将原有的志愿者折叠菜单和管理员的单项合并逻辑
+                    if (isVolunteer || isAdmin) {
                         ExpandableNavigationItem(
                             label = "任务中心",
                             isExpanded = isTaskCenterExpanded,
@@ -681,44 +939,54 @@ private fun AppContentInternal(
                         )
                     }
 
-                    // 管理员功能
+                    // 4. 管理专用项 (仅管理员可见)
                     if (isAdmin) {
-                        NavigationDrawerItem(
-                            label = { Text("任务中心") },
-                            selected = currentScreen == Screen.TaskList,
-                            onClick = { scope.launch { drawerState.close() }; currentScreen = Screen.TaskList }
-                        )
-                        NavigationDrawerItem(
-                            label = { Text("用户管理") },
-                            selected = currentScreen == Screen.UserManagement,
-                            onClick = { scope.launch { drawerState.close() }; currentScreen = Screen.UserManagement }
-                        )
+//                        NavigationDrawerItem(
+//                            label = { Text("用户管理") },
+//                            selected = currentScreen == Screen.UserManagement,
+//                            onClick = {
+//                                scope.launch { drawerState.close() }; currentScreen =
+//                                Screen.UserManagement
+//                            }
+//                        )
                         NavigationDrawerItem(
                             label = { Text("成员管理") },
                             selected = currentScreen == Screen.MemberManagement,
-                            onClick = { scope.launch { drawerState.close() }; currentScreen = Screen.MemberManagement }
+                            onClick = {
+                                currentScreen = Screen.MemberManagement
+                                scope.launch { drawerState.close() }
+                            }
                         )
                         NavigationDrawerItem(
-                            label = { Text("义修社区") },
-                            selected = currentScreen == Screen.Community(),
-                            onClick = { scope.launch { drawerState.close() }; currentScreen = Screen.Community() }
+                            label = { Text("知识库管理") },
+                            selected = currentScreen == Screen.KnowledgeManagement,
+                            onClick = {
+                                currentScreen = Screen.KnowledgeManagement
+                                scope.launch { drawerState.close() }
+                            },
+                            // 你可以根据喜好添加一个图标，比如 Book 或者 Settings，这里暂不加图标以和上方“用户管理”保持一致
                         )
+
                     }
                 }
             }
         )
         {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .blur(radius = blurRadius.value.dp) // 应用切换屏幕时的动态模糊
+        ) {
             AnimatedContent(
                 targetState = currentScreen,
                 transitionSpec = {
-                    fadeIn(animationSpec = tween(500)) togetherWith
-                            fadeOut(animationSpec = tween(500))
+                    fadeIn(animationSpec = tween(300)) togetherWith
+                            fadeOut(animationSpec = tween(300))
                 },
                 label = "PageTransition"
-            )
-
-            { screen ->
+            ) { screen ->
                 val animatedContentScope = this
+
 
                 when (screen) {
                     is Screen.Home -> {
@@ -754,112 +1022,306 @@ private fun AppContentInternal(
                                 modifier = Modifier
                                     .padding(innerPadding)
                                     .fillMaxSize()
-                            ) {
-                                // 保留原有的模糊效果计算
+                            )
+                            {
+                                // 【重点：找回定义】在这里重新定义 cardModifier，确保下方的 Card 可以引用到
                                 val cardBlurRadius by animateDpAsState(
                                     targetValue = if (drawerState.isOpen) 10.dp else 0.dp,
                                     animationSpec = tween(300), label = "cardBlur"
                                 )
-
                                 val cardModifier = if (cardBlurRadius > 0.dp) {
                                     Modifier.blur(cardBlurRadius)
                                 } else {
                                     Modifier
                                 }
 
-                                // 聊天界面容器
-                                Column(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .background(Color.Transparent) // 半透明白色背景
-                                ) {
-                                    // 聊天消息列表
+                                // 1. 底层：聊天消息列表与输入框
+                                Column(modifier = Modifier.fillMaxSize()) {
+
+                                    // A. 消息列表部分
                                     LazyColumn(
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .fillMaxWidth(),
+                                        modifier = Modifier.weight(1f).fillMaxWidth(), // weight(1f) 会把剩余空间全占满，把底部的输入框挤到最下面
                                         reverseLayout = true
                                     ) {
                                         items(chatMessages.reversed()) { message ->
-                                            ChatBubble(message = message)
-                                        }
-                                    }
+                                            // 【修改】：用 Row 包裹气泡，增加头像显示逻辑
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                                                // 用户消息靠右，AI消息靠左
+                                                horizontalArrangement = if (message.role == Role.USER) Arrangement.End else Arrangement.Start,
+                                                verticalAlignment = Alignment.Top
+                                            ) {
+                                                // 如果是 AI 消息，在左侧显示 AI 头像
+                                                if (message.role == Role.ASSISTANT) {
+                                                    Surface(
+                                                        modifier = Modifier.size(36.dp),
+                                                        shape = CircleShape,
+                                                        color = MaterialTheme.colorScheme.primaryContainer
+                                                    ) {
+                                                        Icon(
+                                                            Icons.Default.SmartToy,
+                                                            contentDescription = "AI",
+                                                            modifier = Modifier.padding(6.dp),
+                                                            tint = MaterialTheme.colorScheme.primary
+                                                        )
+                                                    }
+                                                    Spacer(modifier = Modifier.width(8.dp))
+                                                }
 
-                                    // 底部输入区域
+                                                // 聊天气泡，为了防止过长的文本把头像挤没，使用 weight 限制它的最大宽度
+                                                Box(modifier = Modifier.weight(1f, fill = false)) {
+                                                    ChatBubble(message = message)
+                                                }
+
+                                                // 如果是用户消息，在右侧显示用户头像
+                                                if (message.role == Role.USER) {
+                                                    Spacer(modifier = Modifier.width(8.dp))
+                                                    AvatarImage(
+                                                        path = avatarPath,
+                                                        modifier = Modifier.size(36.dp)
+                                                            .clip(CircleShape)
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    } // <--- LazyColumn 到这里结束
+
+                                    // 👇 【关键修复】：你的输入框代码必须粘贴在这里！👇
+                                    // 它必须在 Column 的大括号内部，且在 LazyColumn 的下面
                                     Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(8.dp),
+                                        modifier = Modifier.fillMaxWidth().padding(8.dp),
                                         verticalAlignment = Alignment.Bottom
                                     ) {
                                         OutlinedTextField(
-                                            value = if (isApiLoading) "系统生成文本中" else inputText,  // 根据状态显示不同内容
-                                            onValueChange = { if (!isApiLoading) inputText = it },      // 只有非加载状态下允许输入
-                                            modifier = Modifier.weight(1f),
+                                            value = if (isApiLoading) "系统生成文本中" else inputText,
+                                            onValueChange = {
+                                                if (!isApiLoading) inputText = it
+                                            },
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .padding(end = 8.dp), // 为右侧发送按钮留一点间距
                                             placeholder = { Text("向义修助手提问...") },
                                             singleLine = true,
-                                            keyboardOptions = KeyboardOptions(
-                                                capitalization = KeyboardCapitalization.Sentences,
-                                                imeAction = ImeAction.Send
-                                            ),
-                                            // 根据加载状态设置颜色
-                                            colors = TextFieldDefaults.colors(
+                                            shape = RoundedCornerShape(28.dp),
+                                            colors = OutlinedTextFieldDefaults.colors(
                                                 focusedContainerColor = Color.White,
                                                 unfocusedContainerColor = Color.White,
                                                 disabledContainerColor = Color.White,
-                                                unfocusedIndicatorColor = Color.Transparent,
-                                                focusedIndicatorColor = Color.Transparent,
-                                                unfocusedTextColor = if (isApiLoading) Color.Gray else Color.Black,  // 加载时显示灰色文字
-                                                focusedTextColor = if (isApiLoading) Color.Gray else Color.Black     // 加载时显示灰色文字
+                                                focusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
+                                                unfocusedBorderColor = Color.LightGray.copy(alpha = 0.5f),
+                                                unfocusedTextColor = if (isApiLoading) Color.Gray else Color.Black,
+                                                focusedTextColor = if (isApiLoading) Color.Gray else Color.Black
                                             ),
-                                            shape = RoundedCornerShape(24.dp),
-                                            keyboardActions = KeyboardActions(
-                                                onSend = {
-                                                    if (inputText.isNotBlank() && !isApiLoading) {  // 只有非加载状态下才允许发送
-                                                        sendMessage()
-                                                    }
-                                                }
-                                            ),
+                                            // ... (键盘设置等)
                                             trailingIcon = {
                                                 IconButton(
                                                     onClick = {
-                                                        if (inputText.trim().isNotBlank() && !isApiLoading) {  // 只有非加载状态下才允许发送
+                                                        if (inputText.trim().isNotBlank() && !isApiLoading) {
                                                             sendMessage()
                                                         }
                                                     },
-                                                    enabled = inputText.trim().isNotBlank() && !isApiLoading  // 根据输入内容和加载状态控制按钮可用性
+                                                    enabled = inputText.trim().isNotBlank() && !isApiLoading
                                                 ) {
                                                     Icon(Icons.Default.Send, contentDescription = "发送")
                                                 }
                                             }
                                         )
+                                    }
+                                    // 👆 输入框代码结束 👆
 
+                                } // <--- Column 到这里结束
+
+                                // ====================================================
+                                // 2. 中层：欢迎卡片 (靠上居中)
+                                // ====================================================
+                                // 【新增】：使用 AnimatedVisibility 和 chatMessages.isEmpty() 控制显示与隐藏
+                                AnimatedVisibility(
+                                    visible = chatMessages.isEmpty(),
+                                    enter = fadeIn(tween(300)),
+                                    exit = fadeOut(tween(300)),
+                                    modifier = Modifier.align(Alignment.TopCenter)
+                                ) {
+                                    Card(
+                                        // 注意：把原本在 Card 上的 .align(Alignment.TopCenter) 移到了上面的 AnimatedVisibility 里
+                                        modifier = cardModifier
+                                            .padding(top = 16.dp, start = 32.dp, end = 32.dp)
+                                            .graphicsLayer(alpha = 0.7f),
+                                        colors = CardDefaults.cardColors(
+                                            containerColor = Color.White.copy(
+                                                alpha = 0.8f
+                                            )
+                                        ),
+                                        shape = RoundedCornerShape(16.dp),
+                                        elevation = CardDefaults.cardElevation(0.dp)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier.padding(
+                                                vertical = 24.dp,
+                                                horizontal = 32.dp
+                                            ), contentAlignment = Alignment.Center
+                                        ) {
+                                            Text(
+                                                text = welcomeText,
+                                                style = MaterialTheme.typography.headlineSmall,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
                                     }
                                 }
 
-                                // 原有的欢迎卡片（在聊天界面上方，透明度降低使其不遮挡聊天）
-                                Card(
-                                    modifier = cardModifier
-                                        .align(Alignment.TopCenter)
-                                        .padding(top = 16.dp)
-                                        .padding(horizontal = 32.dp)
-                                        .graphicsLayer(alpha = 0.7f), // 降低透明度，不影响聊天体验
-                                    colors = CardDefaults.cardColors(
-                                        containerColor = Color.White.copy(alpha = 0.8f)
-                                    ),
-                                    shape = RoundedCornerShape(16.dp),
-                                    elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                                // 3. 悬浮按钮组：采用抽屉式折叠设计，不阻挡主视图
+                                Row(
+                                    modifier = Modifier
+                                        .align(Alignment.BottomEnd) // 依旧放在右下角
+                                        .padding(end = 16.dp, bottom = 80.dp), // 向上偏移避开输入框
+                                    verticalAlignment = Alignment.Bottom
+                                ) {
+                                    // 半透明提示箭头
+                                    IconButton(
+                                        onClick = { isFabExpanded = !isFabExpanded },
+                                        modifier = Modifier
+                                            .padding(end = if (isFabExpanded) 8.dp else 0.dp)
+                                            .size(36.dp)
+                                            .background(Color.Gray.copy(alpha = 0.4f), CircleShape)
+                                    ) {
+                                        Icon(
+                                            // 展开时箭头向右，收起时箭头向左
+                                            imageVector = if (isFabExpanded) Icons.Default.KeyboardArrowRight else Icons.Default.KeyboardArrowLeft,
+                                            contentDescription = "切换操作面板",
+                                            tint = Color.White
+                                        )
+                                    }
+
+                                    // 使用横向展开/收缩动画包裹原有的两个功能按钮
+                                    AnimatedVisibility(
+                                        visible = isFabExpanded,
+                                        enter = androidx.compose.animation.expandHorizontally(expandFrom = Alignment.End) + fadeIn(),
+                                        exit = androidx.compose.animation.shrinkHorizontally(shrinkTowards = Alignment.End) + fadeOut()
+                                    ) {
+                                        Column(
+                                            horizontalAlignment = Alignment.End
+                                        ) {
+                                            // 时钟历史按钮
+                                            SmallFloatingActionButton(
+                                                onClick = {
+                                                    val token = userPreferences.token ?: ""
+                                                    loadHistorySessions(token, DoubaoApiClient.instance)
+                                                    showHistoryByClock = true
+                                                    isFabExpanded = false // 点击后自动收起侧边栏
+                                                },
+                                                containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                                                modifier = Modifier.padding(bottom = 8.dp)
+                                            ) {
+                                                Icon(
+                                                    Icons.Default.DateRange,
+                                                    contentDescription = "历史"
+                                                )
+                                            }
+
+                                            // 新建聊天按钮
+                                            SmallFloatingActionButton(
+                                                onClick = {
+                                                    val userToken = userPreferences.token ?: ""
+                                                    startNewChat(
+                                                        conversationId,
+                                                        userToken,
+                                                        DoubaoApiClient.instance
+                                                    ) { newId ->
+                                                        conversationId = newId
+                                                        chatMessages = emptyList()
+                                                        isPendingNewSession = true
+                                                        isFabExpanded = false // 点击后自动收起
+                                                        Toast.makeText(
+                                                            context,
+                                                            "已开启新对话",
+                                                            Toast.LENGTH_SHORT
+                                                        ).show()
+                                                    }
+                                                },
+                                                containerColor = MaterialTheme.colorScheme.primaryContainer
+                                            ) {
+                                                Icon(Icons.Default.Add, contentDescription = "新建")
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // 4. 最顶层：全屏历史记录弹出小窗 (仅在显示时拦截点击)
+                                AnimatedVisibility(
+                                    visible = showHistoryByClock,
+                                    enter = fadeIn() + scaleIn(
+                                        initialScale = 0f,
+                                        transformOrigin = TransformOrigin(1f, 1f)
+                                    ) + slideInVertically { it / 2 },
+                                    exit = fadeOut() + scaleOut(
+                                        targetScale = 0f,
+                                        transformOrigin = TransformOrigin(1f, 1f)
+                                    ) + slideOutVertically { it / 2 }
                                 ) {
                                     Box(
-                                        modifier = Modifier.padding(vertical = 24.dp, horizontal = 32.dp),
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .background(Color.Black.copy(alpha = 0.3f))
+                                            .clickable { showHistoryByClock = false }, // 点击遮罩关闭
                                         contentAlignment = Alignment.Center
                                     ) {
-                                        Text(
-                                            text = welcomeText,
-                                            style = MaterialTheme.typography.headlineSmall,
-                                            color = Color.Black,
-                                            fontWeight = FontWeight.Bold
-                                        )
+                                        Card(
+                                            modifier = Modifier
+                                                .fillMaxWidth(0.85f)
+                                                .fillMaxHeight(0.6f)
+                                                .clickable(enabled = false) { }, // 防止点击窗内关闭
+                                            shape = RoundedCornerShape(16.dp),
+                                            elevation = CardDefaults.cardElevation(8.dp)
+                                        ) {
+                                            Column(modifier = Modifier.padding(16.dp)) {
+                                                Text(
+                                                    "历史对话",
+                                                    style = MaterialTheme.typography.titleLarge
+                                                )
+                                                HorizontalDivider(
+                                                    modifier = Modifier.padding(
+                                                        vertical = 8.dp
+                                                    ), color = Color.Gray.copy(alpha = 0.3f)
+                                                )
+
+                                                LazyColumn {
+                                                    items(sessionList) { session ->
+                                                        Column(
+                                                            modifier = Modifier
+                                                                .fillMaxWidth()
+                                                                .clickable {
+                                                                    conversationId =
+                                                                        session.conversationId
+                                                                    showHistoryByClock = false
+                                                                    loadChatHistory(session.conversationId)
+                                                                }
+                                                                .padding(vertical = 12.dp)
+                                                        ) {
+                                                            Text(
+                                                                text = session.headline,
+                                                                style = MaterialTheme.typography.bodyLarge,
+                                                                maxLines = 1
+                                                            )
+                                                            Text(
+                                                                text = session.createTime.substring(
+                                                                    0,
+                                                                    10
+                                                                ),
+                                                                style = MaterialTheme.typography.bodySmall,
+                                                                color = Color.Gray
+                                                            )
+                                                        }
+                                                        HorizontalDivider(
+                                                            color = Color.Gray.copy(
+                                                                alpha = 0.2f
+                                                            )
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -895,12 +1357,14 @@ private fun AppContentInternal(
                             }
                         }
                     }
+
                     is Screen.MyTasks -> {
                         Scaffold(
                             topBar = {
                                 StandardTopAppBar(
                                     title = "我的任务",
-                                    drawerState = drawerState, scope = scope,
+                                    drawerState = drawerState,
+                                    scope = scope,
                                     isLoggedIn = isLoggedIn,
                                     avatarPath = avatarPath,
                                     hasUnreadMessages = hasUnread,
@@ -916,12 +1380,14 @@ private fun AppContentInternal(
                                 modifier = Modifier
                                     .padding(innerPadding)
                                     .fillMaxSize(),
-                                color = Color.White.copy(alpha = 0.9f)
+                                color = Color.White.copy(alpha = 0.9f) // 保持与任务列表一致的风格
                             ) {
-                                MyTasksScreen()
+                                // 直接调用我们下面定义的 MyTasksScreen
+                                MyTasksScreen(userPreferences = userPreferences)
                             }
                         }
                     }
+
                     is Screen.Profile -> {
                         ProfileScreen(
                             userPreferences = userPreferences,
@@ -942,6 +1408,31 @@ private fun AppContentInternal(
                             onBack = { currentScreen = Screen.Profile } // 返回时回到个人中心
                         )
                     }
+
+                    is Screen.MemberManagement -> {
+                        Scaffold(
+                            topBar = {
+                                // 建议复用你的 StandardTopAppBar 或者写一个简单的带返回键的 TopBar
+                                TopAppBar(
+                                    title = { Text("成员管理") },
+                                    navigationIcon = {
+                                        IconButton(onClick = { currentScreen = Screen.Home }) {
+                                            Icon(
+                                                Icons.Default.ArrowBack,
+                                                contentDescription = "返回"
+                                            )
+                                        }
+                                    }
+                                )
+                            }
+                        ) { padding ->
+                            Box(modifier = Modifier.padding(padding)) {
+                                // 调用上面在 MemberScreen.kt 中定义的页面
+                                MemberManagementScreen(userPreferences = userPreferences)
+                            }
+                        }
+                    }
+
                     is Screen.Login -> {
                         // 【修改】移除 Scaffold，让 AuthScreen 直接显示在模糊背景之上
                         Box(modifier = Modifier.fillMaxSize()) {
@@ -971,6 +1462,7 @@ private fun AppContentInternal(
                             }
                         }
                     }
+
                     Screen.AppointmentQuestionnaire -> {
                         Scaffold(
                             topBar = {
@@ -994,6 +1486,7 @@ private fun AppContentInternal(
                             )
                         }
                     }
+
                     Screen.RepairHistory -> {
                         Scaffold(
                             topBar = {
@@ -1012,19 +1505,24 @@ private fun AppContentInternal(
                             key(userPreferences.userId) {
                                 RepairHistoryScreen(
                                     userPreferences = userPreferences,
-                                    onNavigateToDetail = { taskId -> currentScreen = Screen.RepairDetail(taskId) },
+                                    onNavigateToDetail = { taskId ->
+                                        currentScreen = Screen.RepairDetail(taskId)
+                                    },
                                     modifier = Modifier.padding(innerPadding)
                                 )
                             }
                         }
                     }
+
                     is Screen.RepairDetail -> {
                         Scaffold(
                             topBar = {
                                 TopAppBar(
                                     title = { Text("维修详情") },
                                     navigationIcon = {
-                                        IconButton(onClick = { currentScreen = Screen.RepairHistory }) {
+                                        IconButton(onClick = {
+                                            currentScreen = Screen.RepairHistory
+                                        }) {
                                             Icon(Icons.Default.ArrowBack, "Back")
                                         }
                                     },
@@ -1036,10 +1534,12 @@ private fun AppContentInternal(
                             RepairDetailScreen(
                                 userPreferences = userPreferences,
                                 taskId = screen.taskId,
-                                modifier = Modifier.padding(innerPadding)
+                                modifier = Modifier.padding(innerPadding),
+                                onBack = { currentScreen = Screen.RepairHistory }
                             )
                         }
                     }
+
                     is Screen.MessageCenter -> {
                         Scaffold(
                             topBar = {
@@ -1062,15 +1562,36 @@ private fun AppContentInternal(
                             )
                         }
                     }
+
                     is Screen.Community -> {
                         CommunityScreen(
                             userPreferences = userPreferences,
                             onNavigateToCreatePost = { currentScreen = Screen.CreatePost },
                             onBack = { currentScreen = Screen.Home },
                             preloadedPosts = (screen as Screen.Community).preloadedPosts,
-                            // 【新增】传入跳转回调
                             onNavigateToMyCollection = { currentScreen = Screen.MyCollection },
-                            onPostClick = { postId -> currentScreen = Screen.PostDetail(postId)}
+                            // 【新增】处理点击头像跳转
+                            onUserClick = { userId ->
+                                currentScreen = Screen.OtherUserProfile(userId)
+                            },
+                            onPostClick = { postId ->
+                                currentScreen = Screen.PostDetail(postId)
+                            }
+                        )
+                    }
+
+                    is Screen.OtherUserProfile -> {
+                        // 先获取当前的 screen 实例，方便后续引用
+                        val profileScreen = screen as Screen.OtherUserProfile
+
+                        OtherUserProfileScreen(
+                            targetUserId = profileScreen.userId, // 使用解析出来的 userId
+                            userPreferences = userPreferences,
+                            onBack = {
+                                // 【修复逻辑错误】：返回通常是回到社区主页
+                                // 如果你的 Screen.Community 需要参数，请传入对应的参数（如 null）
+                                currentScreen = Screen.Community(null)
+                            }
                         )
                     }
 
@@ -1078,9 +1599,12 @@ private fun AppContentInternal(
                     is Screen.MyCollection -> {
                         MyCollectionScreen(
                             onBack = { currentScreen = Screen.Community() },
-                            onPostClick = { postId -> currentScreen = Screen.PostDetail(postId) }// 返回社区
+                            onPostClick = { postId ->
+                                currentScreen = Screen.PostDetail(postId)
+                            }// 返回社区
                         )
                     }
+
                     is Screen.CreatePost -> {
                         CreatePostScreen(
                             onBack = { currentScreen = Screen.Community() },
@@ -1090,19 +1614,46 @@ private fun AppContentInternal(
                             }
                         )
                     }
+
                     is Screen.PostDetail -> {
                         PostDetailScreen(
-                            postId = screen.postId,
-                            onBack = { currentScreen = Screen.Community() } // 看完详情返回社区主页
+                            postId = (screen as Screen.PostDetail).postId,
+                            // 【修复报错 1550】确保返回时状态赋值正确
+                            onBack = {
+                                // 如果 Community 不需要预加载数据，传 null
+                                currentScreen = Screen.Community(null)
+                            },
+                            // 【修复报错 1552】现在参数已在第一步中定义，不会再报错了
+                            onUserClick = { userId: Int -> // 显式声明类型以解决类型推导问题
+                                currentScreen = Screen.OtherUserProfile(userId)
+                            }
                         )
                     }
+
+                    is Screen.KnowledgeManagement -> {
+                        // 获取用户 token。请根据你实际的 DataStore 或 UserPreferences 结构来获取 token。
+                        // 假设 userPreferences 中有 token 字段，如果没有请替换为你实际获取 token 的代码
+                        val token = userPreferences.token ?: ""
+
+                        // 调用我们刚刚写好的知识库管理页面
+                        // 注意：因为 KnowledgeScreen 内部已经自带了 Scaffold 和 TopAppBar，所以这里不需要再包一层 Scaffold
+                        KnowledgeScreen (
+                            token = token,
+                            onBack = {
+                                currentScreen = Screen.Home // 点击返回按钮回到主页，你也可以改成 Screen.Profile
+                            }
+                        )
+                    }
+
                     else -> {
                         // 如果进入了未知的 Screen，暂时显示一个空 Box 或者占位符
                         Box(modifier = Modifier.fillMaxSize())
                     }
                 }
-
             }
+        }
+
+
         }
 
         AnimatedVisibility(modifier = Modifier.align(Alignment.CenterStart), visible = drawerState.isClosed && currentScreen == Screen.Home) {
@@ -1193,77 +1744,6 @@ private fun AppContentInternal(
             }
         }
 
-    }
-}
-
-@Composable
-fun TaskListScreen(
-    modifier: Modifier = Modifier,
-    userPreferences: UserPreferences
-) {
-    var isLoading by remember { mutableStateOf(true) }
-    // 控制详情页显示：如果不为空，则显示详情页
-    var selectedTask by remember { mutableStateOf<RepairTaskItem?>(null) }
-    var tasks by remember { mutableStateOf<List<RepairTaskItem>>(emptyList()) }
-    val context = LocalContext.current
-    val token = remember { userPreferences.token }
-
-    // 获取数据
-    LaunchedEffect(Unit) {
-        if (!token.isNullOrEmpty()) {
-            isLoading = true
-            try {
-                val authHeader = if (token.startsWith("Bearer ")) token else "Bearer $token"
-                // 确保 NetworkClient 引用正确
-                val response = com.example.yixiu_1.network.NetworkClient.instance.getAllTasks(authHeader)
-
-                // 【修复】解析逻辑：先获取 ApiResponse，再获取 data，再获取 list
-                if (response.isSuccessful && response.body()?.code == 200) {
-                    val data = response.body()?.data
-                    tasks = data?.list ?: emptyList()
-                } else {
-                    Toast.makeText(context, "获取失败: ${response.code()}", Toast.LENGTH_SHORT).show()
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-                Toast.makeText(context, "网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
-            } finally {
-                isLoading = false
-            }
-        }
-    }
-
-    // 页面内容切换：列表 OR 详情
-    Box(modifier = modifier.fillMaxSize()) {
-        if (selectedTask != null) {
-            // === 显示详情页 (如果还没有定义 TaskDetailScreen，请看下一步) ===
-            // 这里临时调用，或者你需要添加 TaskDetailScreen 组件
-            TaskDetailScreen(
-                task = selectedTask!!,
-                onBack = { selectedTask = null }
-            )
-        } else {
-            // === 显示列表页 ===
-            if (isLoading) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator()
-                }
-            } else if (tasks.isEmpty()) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("暂无维修任务", color = Color.Gray)
-                }
-            } else {
-                LazyColumn(
-                    contentPadding = PaddingValues(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                    modifier = Modifier.fillMaxSize()
-                ) {
-                    items(tasks) { task ->
-                        RepairTaskCard(task = task, onClick = { selectedTask = task })
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -1368,7 +1848,29 @@ fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, 
 
                 // 注意：请确保你的 ApiService.kt 中已经定义了这个 getUserInfo(token) 方法
                 val response = NetworkClient.instance.getUserInfo() // 根据你现有的写法，这里可能不需要传参，看你接口怎么定义的
+                // 假设这里是你的 getUserInfo 网络请求成功的回调内部
+                if (response.isSuccessful && response.body()?.code == 200) {
+                    val userInfo = response.body()?.data
 
+                    if (userInfo != null) {
+                        // 第一步：检查 Gson 解析网络响应是否成功
+                        Log.e("Debug_1", "网络返回的 volunteerInfo 对象: ${userInfo.volunteerInfo}")
+                        Log.e("Debug_1", "网络返回的 volunteerId: ${userInfo.volunteerInfo?.volunteerId}")
+
+                        // 第二步：执行保存
+                        userPreferences.volunteerInfo = userInfo.volunteerInfo
+                        // 如果你用的是 saveLoginInfo，就在这里调用：
+                        // userPreferences.saveLoginInfo(..., volunteerDetail = userInfo.volunteerInfo)
+
+                        // 第三步：直接暴力读取 SharedPreferences 的底层 XML，看有没有存进去
+                        val sharedPrefs = context.getSharedPreferences("user_prefs", Context.MODE_PRIVATE)
+                        val rawJson = sharedPrefs.getString("volunteer_info", "没存进去！")
+                        Log.e("Debug_2", "底层SharedPreferences存的JSON是: $rawJson")
+
+                        // 第四步：检查 UserPreferences 的反序列化读取
+                        Log.e("Debug_3", "UserPreferences读出的 volunteerId: ${userPreferences.volunteerId}")
+                    }
+                }
                 // 判断登录是否依然有效
                 if (response.isSuccessful && response.body()?.code == 200) {
                     // Token 有效！直接静默跳转到首页
@@ -1564,12 +2066,18 @@ fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, 
                                         try {
                                             val uResp = NetworkClient.instance.getUserInfo()
                                             val userInfo = uResp.body()?.data
-                                            if (userInfo != null && userInfo is com.example.yixiu_1.network.UserInfo) {
-                                                userPreferences.userId = userInfo.userId
-                                                userPreferences.userEmail = userInfo.email
-                                                userPreferences.nickname = userInfo.username
-                                                userPreferences.userRole = userInfo.role
-                                                userPreferences.avatarPath = userInfo.avatar
+                                            // 只要请求成功且拿到了用户信息，就一次性完整保存
+                                            if (userInfo != null) {
+                                                // ✅ 【核心修复】：直接调用我们在 UserPreferences 里写好的 saveLoginInfo 方法！
+                                                userPreferences.saveLoginInfo(
+                                                    token = token,
+                                                    userId = userInfo.userId,
+                                                    username = userInfo.username ?: "未知用户",
+                                                    userEmail = userInfo.email ?: "",
+                                                    avatarPath = userInfo.avatar,
+                                                    role = userInfo.role,
+                                                    volunteerInfo = userInfo.volunteerInfo // 把包含 volunteerId 的核心对象传进去！
+                                                )
                                             }
                                         } catch (e: Exception) {
                                             Log.e("Auth", "Fetch user info failed", e)
@@ -1916,49 +2424,56 @@ fun RepairHistoryScreen(
     onNavigateToDetail: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    var history by remember { mutableStateOf<List<RepairHistoryItem>>(emptyList()) }
+    // 【修改 1】：数据类型改为后端的 RepairTaskItem
+    var history by remember { mutableStateOf<List<RepairTaskItem>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val token = userPreferences.token?.let { if (it.startsWith("Bearer ")) it else "Bearer $it" } ?: ""
+    var refreshTrigger by remember { mutableIntStateOf(0) }
 
-    LaunchedEffect(Unit) {
-        val userId = userPreferences.userId
-        if (userId == -1) {
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                refreshTrigger += 1
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    // 【修改 2】：从访问本地偏好改为请求网络接口
+    LaunchedEffect(refreshTrigger) {
+        isLoading = true
+        if (token.isBlank()) {
             Toast.makeText(context, "请先登录", Toast.LENGTH_SHORT).show()
             isLoading = false
             return@LaunchedEffect
         }
+
         try {
-            val localHistory = userPreferences.getRepairHistory()
-            // 按提交时间倒序排序
-            history = localHistory.sortedByDescending { it.submissionDate }
+            // 核心魔法：让协程先睡 300 毫秒，等页面切换的转场动画彻底播完
+            kotlinx.coroutines.delay(300)
+
+            val response = NetworkClient.instance.getMyRepairHistory(token, 1, 50)
+            if (response.isSuccessful && response.body()?.code == 200) {
+                history = response.body()?.data?.list ?: emptyList()
+            } else {
+                Toast.makeText(context, "加载失败: ${response.body()?.msg}", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: CancellationException) {
+            // 【核心修复】：如果是 Compose 正常的页面切换导致的协程取消，直接抛出，不要当成报错！
+            throw e
         } catch (e: Exception) {
-            // 如果读取失败，history 保持为空
-            Log.e("RepairHistory", "Error loading local history", e)
+            // 只有真正的网络断开、解析失败等，才会走到这里
+            Log.e("RepairHistory", "请求历史记录异常", e)
+            Toast.makeText(context, "网络异常", Toast.LENGTH_SHORT).show()
         } finally {
             isLoading = false
         }
-//        scope.launch {
-//            try {
-//                // 如果您在 NetworkClient 中添加了 getRepairHistory(userId)，请取消注释并使用
-//                // 目前代码为了防止报错，暂时只做 Toast 提示，因为 ApiService 定义中没有该方法。
-//                // 如果 ApiService 有：
-//                /*
-//                val response = NetworkClient.instance.getRepairHistory(userId)
-//                if (response.isSuccessful) {
-//                    history = response.body()?.data ?: emptyList()
-//                } else {
-//                    Toast.makeText(context, "加载历史记录失败", Toast.LENGTH_SHORT).show()
-//                }
-//                */
-//                // 模拟数据 (防止报错)
-//                isLoading = false
-//            } catch (e: Exception) {
-//                Toast.makeText(context, "网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
-//            } finally {
-//                isLoading = false
-//            }
-//        }
     }
 
     Box(
@@ -1968,7 +2483,37 @@ fun RepairHistoryScreen(
         contentAlignment = Alignment.Center
     ) {
         if (isLoading) {
-            CircularProgressIndicator(color = Color.White)
+            Box(
+                modifier = modifier
+                    .fillMaxSize()
+                    .padding(16.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                if (isLoading) {
+                    // 【优化 2】：使用骨架屏占位，不打断用户的页面结构感知
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        // 渲染 4 个骨架屏卡片作为假数据展示
+                        items(4) {
+                            SkeletonHistoryCard()
+                        }
+                    }
+                } else if (history.isEmpty()) {
+                    // ... 暂无报修记录的代码保持不变 ...
+                } else {
+                    // ... 渲染真实数据的 LazyColumn 保持不变 ...
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        items(history, key = { it.requestId }) { item ->
+                            RepairTaskHistoryCard(item = item, onClick = { onNavigateToDetail(item.requestId.toString()) })
+                        }
+                    }
+                }
+            }
         } else if (history.isEmpty()) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(
@@ -1988,85 +2533,191 @@ fun RepairHistoryScreen(
                 modifier = Modifier.fillMaxSize(),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                items(history) { item ->
-                    HistoryCard(item = item, onClick = { onNavigateToDetail(item.id) })
+                items(history, key = { it.requestId }) { item ->
+                    // 传入 item.requestId.toString() 以匹配外部 onNavigateToDetail(String) 的签名
+                    RepairTaskHistoryCard(item = item, onClick = { onNavigateToDetail(item.requestId.toString()) })
                 }
             }
         }
     }
 }
 
+// 【新增】：专为网络数据结构设计的历史卡片
 @Composable
-fun HistoryCard(item: RepairHistoryItem, onClick: () -> Unit) {
+fun RepairTaskHistoryCard(
+    item: RepairTaskItem,
+    onClick: () -> Unit
+) {
+    // 状态文本映射
+    val statusText = when(item.status) {
+        0 -> "待审核"
+        1 -> "审核通过"
+        2 -> "已被接收"
+        3 -> "已完成"
+        4 -> "已取消"
+        5 -> "自行解决"
+        6 -> "已被拒绝"
+        7 -> "已评价"
+        else -> "未知状态"
+    }
+
+    // 状态颜色映射 (你提供的规则)
+    val statusColor = when(item.status) {
+        0 -> Color(0xFFFFA000) // 橙色
+        1, 2 -> Color(0xFF1976D2) // 蓝色
+        3, 7 -> Color(0xFF43A047) // 绿色
+        6 -> Color(0xFFD32F2F) // 红色
+        else -> Color.Gray
+    }
+
+
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = Color.White.copy(alpha = 0.85f)
-        ),
-        elevation = CardDefaults.cardElevation(4.dp)
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
-        Column(Modifier.padding(16.dp)) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            // --- 顶部：设备标题和状态标签 ---
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                val deviceName = if (item.deviceSystem.isNullOrBlank() && item.deviceModel.isNullOrBlank()) {
+                    "未知设备"
+                } else {
+                    "${item.deviceSystem ?: ""} ${item.deviceModel ?: ""}".trim()
+                }
+
+                Text(
+                    text = deviceName,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFF333333),
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+
+                // 状态标签
+                Surface(
+                    color = statusColor.copy(alpha = 0.1f),
+                    shape = RoundedCornerShape(4.dp)
+                ) {
+                    Text(
+                        text = statusText,
+                        color = statusColor,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // --- 问题描述 ---
             Text(
-                "描述: ${item.problemDescription}",
-                style = MaterialTheme.typography.titleMedium,
+                text = item.problemDescription ?: "无详细描述",
+                color = Color.DarkGray,
+                style = MaterialTheme.typography.bodyMedium,
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis
             )
-            Spacer(Modifier.height(8.dp))
 
-            // Task.kt 中的 RepairHistoryItem 没有 status 字段
-            // 这里显示设备类型作为替代信息，或者您可以显示校区
-            Text(
-                "设备: ${item.deviceType} - ${item.deviceModel}",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurface
-            )
+            Spacer(modifier = Modifier.height(12.dp))
+            HorizontalDivider(color = Color(0xFFEEEEEE))
+            Spacer(modifier = Modifier.height(12.dp))
 
-            Spacer(Modifier.height(4.dp))
-            Text(
-                // Task.kt 中使用的是 submissionDate
-                "提交时间: ${item.submissionDate}",
-                style = MaterialTheme.typography.bodySmall,
-                color = Color.Gray
-            )
+            // --- 动态展示分配信息 (如果有) ---
+            if (!item.repairAssignment.isNullOrEmpty()) {
+                val volunteers = item.repairAssignment.mapNotNull { it.volunteerName }.joinToString("、")
+                Row(verticalAlignment = Alignment.Top) {
+                    Icon(Icons.Default.Person, contentDescription = null, modifier = Modifier.size(16.dp), tint = Color.Gray)
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("服务志愿者: $volunteers", fontSize = 13.sp, color = Color(0xFF555555))
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+            }
+
+            // --- 动态展示维修日志信息 (如果有) ---
+            if (!item.repairLog.isNullOrEmpty()) {
+                // 取最新的一条日志展示
+                val latestLog = item.repairLog.last()
+                Row(verticalAlignment = Alignment.Top) {
+                    Icon(Icons.Default.Build, contentDescription = null, modifier = Modifier.size(16.dp), tint = Color.Gray)
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = "最新进展: ${latestLog.logContent ?: "无"}",
+                        fontSize = 13.sp,
+                        color = Color(0xFF555555),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+            }
+
+            // --- 底部：时间和单号 ---
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = "单号: ${item.requestId}",
+                    color = Color.Gray,
+                    fontSize = 12.sp
+                )
+                Text(
+                    text = item.createTime?.replace("T", " ")?.substringBefore(".") ?: "未知时间",
+                    color = Color.Gray,
+                    fontSize = 12.sp
+                )
+            }
         }
     }
 }
-
 @Composable
 fun RepairDetailScreen(
     userPreferences: UserPreferences,
     taskId: String,
+    onBack: () -> Unit, // 【修改 1】：新增 onBack 参数，用于评价成功后退出页面
     modifier: Modifier = Modifier
 ) {
-    var detail by remember { mutableStateOf<RepairHistoryItem?>(null) }
+    var detail by remember { mutableStateOf<RepairTaskItem?>(null) }
     var isLoading by remember { mutableStateOf(true) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
 
-    LaunchedEffect(taskId) {
-        try {
-            // 【关键修改】优先从本地数据中查找对应的工单
-            // 因为刚刚提交的数据保存在本地，网络接口可能还没有
-            val localHistory = userPreferences.getRepairHistory()
-            val localItem = localHistory.find { it.id == taskId }
+    // 提取 token 到外层，方便网络请求和评价时使用
+    val token = userPreferences.token?.let { if (it.startsWith("Bearer ")) it else "Bearer $it" } ?: ""
 
-            if (localItem != null) {
-                detail = localItem
+    // 【新增】：评价弹窗相关的状态变量
+    var showEvalDialog by remember { mutableStateOf(false) }
+    var evalContent by remember { mutableStateOf("") }
+    var evalScore by remember { mutableIntStateOf(5) } // 默认 5 星
+    var isSubmittingEval by remember { mutableStateOf(false) }
+
+    LaunchedEffect(taskId) {
+        if (token.isBlank()) {
+            Toast.makeText(context, "请先登录", Toast.LENGTH_SHORT).show()
+            isLoading = false
+            return@LaunchedEffect
+        }
+
+        try {
+            val response = NetworkClient.instance.getMyRepairHistory(token, 1, 100)
+            if (response.isSuccessful && response.body()?.code == 200) {
+                val list = response.body()?.data?.list ?: emptyList()
+                detail = list.find { it.requestId.toString() == taskId }
             } else {
-                // 如果本地找不到，尝试请求网络接口 (如果已实现)
-                /*
-                val response = NetworkClient.instance.getRepairDetail(taskId)
-                if (response.isSuccessful) {
-                    detail = response.body()?.data
-                }
-                */
+                Toast.makeText(context, "获取详情失败: ${response.body()?.msg}", Toast.LENGTH_SHORT).show()
             }
         } catch (e: Exception) {
-            Toast.makeText(context, "加载详情出错: ${e.message}", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, "网络异常，加载详情出错", Toast.LENGTH_SHORT).show()
         } finally {
             isLoading = false
         }
@@ -2088,54 +2739,234 @@ fun RepairDetailScreen(
             )
         } else {
             val item = detail!!
+
+            val statusText = when(item.status) {
+                0 -> "待审核"
+                1 -> "审核通过"
+                2 -> "已被接收"
+                3 -> "已完成"
+                4 -> "已取消"
+                5 -> "自行解决"
+                6 -> "已被拒绝"
+                7 -> "已评价"
+                else -> "未知状态"
+            }
+            val statusColor = when(item.status) {
+                0 -> Color(0xFFFFA000)
+                1, 2 -> Color(0xFF1976D2)
+                3, 7 -> Color(0xFF43A047)
+                6 -> Color(0xFFD32F2F)
+                else -> Color.Gray
+            }
+
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
                     .verticalScroll(rememberScrollState()),
                 shape = RoundedCornerShape(12.dp),
                 colors = CardDefaults.cardColors(
-                    containerColor = Color.White.copy(alpha = 0.9f)
+                    containerColor = Color.White.copy(alpha = 0.95f)
                 ),
                 elevation = CardDefaults.cardElevation(4.dp)
             ) {
                 Column(Modifier.padding(24.dp)) {
-                    Text(
-                        "维修工单详情",
-                        style = MaterialTheme.typography.headlineSmall,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Divider(Modifier.padding(vertical = 8.dp))
+                    // --- 头部标题与状态 ---
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "维修工单详情",
+                            style = MaterialTheme.typography.headlineSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Surface(
+                            color = statusColor.copy(alpha = 0.1f),
+                            shape = RoundedCornerShape(4.dp)
+                        ) {
+                            Text(
+                                text = statusText,
+                                color = statusColor,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                            )
+                        }
+                    }
+                    HorizontalDivider(Modifier.padding(vertical = 12.dp))
 
-                    DetailRow("任务ID:", item.id)
+                    // --- 基本与设备信息 ---
+                    DetailRow("任务单号:", item.requestId.toString())
                     DetailRow("问题描述:", item.problemDescription)
-                    DetailRow("校区:", item.campus)
-                    DetailRow("地址:", item.repairLocation)
+                    DetailRow("校区:", if (item.campus == "0") "南校区" else if (item.campus == "1") "新校区" else item.campus)
+                    DetailRow("详细地址:", item.repairLocation)
 
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text("设备信息", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = Color(0xFF333333))
                     Spacer(modifier = Modifier.height(8.dp))
-                    Text("设备信息", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                    DetailRow("类型:", item.deviceType)
-                    DetailRow("型号:", item.deviceModel)
-                    DetailRow("系统:", item.deviceSystem)
+                    DetailRow("设备类型:", item.deviceType)
+                    DetailRow("设备品牌/型号:", item.deviceModel)
+                    DetailRow("操作系统:", item.deviceSystem)
 
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text("联系与预约", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = Color(0xFF333333))
                     Spacer(modifier = Modifier.height(8.dp))
-                    Text("联系与预约", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                    DetailRow("联系方式:", "${item.contactType} - ${item.contactInfo}")
+                    DetailRow("联系方式:", "${item.contactType ?: "未知"} - ${item.contactInfo ?: "无"}")
                     DetailRow("预约时间:", item.appointmentTime)
 
                     if (!item.remarks.isNullOrBlank()) {
-                        DetailRow("备注:", item.remarks)
+                        DetailRow("报修备注:", item.remarks)
                     }
 
-                    Divider(Modifier.padding(vertical = 8.dp))
-                    DetailRow("提交时间:", item.submissionDate)
+                    // --- 分配信息 (志愿者接单情况) ---
+                    if (!item.repairAssignment.isNullOrEmpty()) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text("服务志愿者信息", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.secondary)
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        item.repairAssignment.forEach { assign ->
+                            Card(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F5F5)),
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Column(Modifier.padding(12.dp)) {
+                                    DetailRow("志愿者:", "${assign.volunteerName ?: "未知"} ${if (assign.isLeader == 1) "(负责人)" else ""}")
+                                    DetailRow("联系方式:", assign.contactNumber)
+                                    DetailRow("接单时间:", assign.assignedTime?.replace("T", " ")?.substringBefore(".") ?: "未知")
+                                    if (!assign.remarks.isNullOrBlank()) {
+                                        DetailRow("备注:", assign.remarks)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // --- 维修日志 (维修进度情况) ---
+                    if (!item.repairLog.isNullOrEmpty()) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text("维修进度记录", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.secondary)
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        item.repairLog.forEach { log ->
+                            Card(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F5F5)),
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Column(Modifier.padding(12.dp)) {
+                                    DetailRow("记录人:", log.volunteerName ?: "未知")
+                                    DetailRow("故障原因:", log.logContent)
+                                    DetailRow("解决方案:", log.repairDuration)
+                                    if (!log.solutionSummary.isNullOrBlank()) {
+                                        DetailRow("备注:", log.solutionSummary)
+                                    }
+                                    DetailRow("记录时间:", log.uploadTime?.replace("T", " ")?.substringBefore(".") ?: "未知")
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalDivider(Modifier.padding(vertical = 16.dp))
+                    DetailRow("提交时间:", item.createTime?.replace("T", " ")?.substringBefore("."))
+                    if (item.status == 3 && item.completeTime != null) {
+                        DetailRow("完成时间:", item.completeTime.replace("T", " ").substringBefore("."))
+                    }
+
+                    // 👇 【修改 2】：如果任务已完成，在卡片最底部显示评价按钮
+                    if (item.status == 3) {
+                        Spacer(modifier = Modifier.height(24.dp))
+                        Button(
+                            onClick = { showEvalDialog = true },
+                            modifier = Modifier.fillMaxWidth().height(50.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF9800)),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Icon(Icons.Default.Star, contentDescription = null, tint = Color.White)
+                            Spacer(Modifier.width(8.dp))
+                            Text("评价本次服务", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                        }
+                    }
                 }
             }
+        }
+
+        // 👇 【修改 3】：评价弹窗 UI（置于 Box 最外层，覆盖在内容上方）
+        if (showEvalDialog && detail != null) {
+            AlertDialog(
+                onDismissRequest = { if (!isSubmittingEval) showEvalDialog = false },
+                title = { Text("服务评价", fontWeight = FontWeight.Bold) },
+                text = {
+                    Column {
+                        Text("请为本次义修服务打分：")
+                        Spacer(modifier = Modifier.height(8.dp))
+                        // 简易星级评分条
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+                            for (i in 1..5) {
+                                IconButton(onClick = { evalScore = i }) {
+                                    Icon(
+                                        imageVector = if (i <= evalScore) Icons.Filled.Star else Icons.Outlined.StarBorder,
+                                        contentDescription = "Star $i",
+                                        tint = if (i <= evalScore) Color(0xFFFFB300) else Color.Gray,
+                                        modifier = Modifier.size(36.dp)
+                                    )
+                                }
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(16.dp))
+                        OutlinedTextField(
+                            value = evalContent,
+                            onValueChange = { evalContent = it },
+                            label = { Text("评价内容 (选填)") },
+                            modifier = Modifier.fillMaxWidth(),
+                            minLines = 3
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            isSubmittingEval = true
+                            scope.launch {
+                                try {
+                                    val request = AddEvaluationRequest(detail!!.requestId, evalContent.ifBlank { "很好" }, evalScore)
+                                    val response = NetworkClient.instance.addEvaluation(token, request)
+                                    if (response.isSuccessful && response.body()?.code == 200) {
+                                        Toast.makeText(context, "评价成功！", Toast.LENGTH_SHORT).show()
+                                        showEvalDialog = false
+                                        onBack() // 自动退回历史页面（历史页面中的 ON_RESUME 将自动触发刷新）
+                                    } else {
+                                        Toast.makeText(context, "评价失败: ${response.body()?.msg}", Toast.LENGTH_SHORT).show()
+                                    }
+                                } catch (e: Exception) {
+                                    Toast.makeText(context, "网络异常，提交失败", Toast.LENGTH_SHORT).show()
+                                } finally {
+                                    isSubmittingEval = false
+                                }
+                            }
+                        },
+                        enabled = !isSubmittingEval
+                    ) {
+                        if (isSubmittingEval) CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White)
+                        else Text("提交评价")
+                    }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = { showEvalDialog = false },
+                        enabled = !isSubmittingEval
+                    ) { Text("取消", color = Color.Gray) }
+                }
+            )
         }
     }
 }
 
+
 @Composable
-fun DetailRow(label: String, value: String, highlight: Boolean = false) {
+fun DetailRow(label: String, value: String?, highlight: Boolean = false) { // 【关键修改 1】：把 value: String 改为 value: String?
     Column(Modifier.padding(vertical = 8.dp)) {
         Text(
             label,
@@ -2143,14 +2974,13 @@ fun DetailRow(label: String, value: String, highlight: Boolean = false) {
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         Text(
-            value,
+            value ?: "无", // 【关键修改 2】：使用 ?: 处理空值，如果后端返回 null，则显示 "无"
             style = if (highlight) MaterialTheme.typography.titleMedium else MaterialTheme.typography.bodyLarge,
             color = if (highlight) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
         )
     }
     Divider(color = Color.Black.copy(alpha = 0.1f))
 }
-
 
 
 @Composable
@@ -2193,7 +3023,7 @@ fun MessageCenterScreen(
     // ================== 核心函数：标记已读 ==================
     fun markAsRead(item: NotifyItem) {
         // 如果已经是已读(1)，不需要操作
-        if (item.isRead == 1) return
+        if (item.isRead == 1 || item.isRead == null) return
 
         // 1. 乐观更新：立即在本地 UI 把它变成已读，让红点立即消失，体验更好
         allNotifications = allNotifications.map {
@@ -2210,7 +3040,7 @@ fun MessageCenterScreen(
 
                     // 如果服务器返回失败 (非200)，则回滚本地状态
                     if (!response.isSuccessful || response.body()?.code != 200) {
-                        Log.e("MarkRead", "Failed to mark as read: ${response.code()}")
+                        Log.e("MarkRead", "Failed to mark as read: ${response.body()?.data}")
                         // 回滚：改回未读
                         allNotifications = allNotifications.map {
                             if (it.notifyId == item.notifyId) it.copy(isRead = 0) else it
@@ -2244,8 +3074,17 @@ fun MessageCenterScreen(
                 // 【关键修正】先获取 Page 对象，再获取 List
                 val pageData = response.body()?.data
 
-                // 1. 提取列表
-                val newItems = pageData?.list ?: emptyList()
+                // 1. 提取列表并进行数据清洗
+                val rawItems = pageData?.list ?: emptyList()
+
+                // 【关键修改】：遍历拿到的数据，一旦发现 isRead 是 null，直接在本地把它变成 1（已读）
+                val newItems = rawItems.map { item ->
+                    if (item.isRead == null) {
+                        item.copy(isRead = 1)
+                    } else {
+                        item
+                    }
+                }
                 // 这里是翻页覆盖模式（点击下一页，列表刷新为新页数据），如果是无限滚动则需要 list + newItems
                 allNotifications = newItems.sortedByDescending { it.createTime }
 
@@ -2411,80 +3250,129 @@ fun MessageCenterScreen(
 fun TaskListScreen(
     userPreferences: UserPreferences
 ) {
-    // 状态管理
+    // === 1. 原有状态管理 ===
     var tasks by remember { mutableStateOf<List<RepairTaskItem>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
-    // 控制详情页显示：如果部位空，则显示详情页
     var selectedTask by remember { mutableStateOf<RepairTaskItem?>(null) }
 
+    // === 2. 【新增】分页状态管理 ===
+    var currentPage by remember { mutableIntStateOf(1) } // 当前页，默认第一页
+    var totalPages by remember { mutableIntStateOf(1) }  // 总页数
+    val pageSize = 10 // 每页请求的数量
+
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val token = remember { userPreferences.token }
 
-    // 获取数据
-    LaunchedEffect(Unit) {
-        if (!token.isNullOrEmpty()) {
-            isLoading = true
-            try {
-                val authHeader = if (token.startsWith("Bearer ")) token else "Bearer $token"
+    // === 3. 提取获取数据逻辑，并增加分页参数 ===
+    suspend fun loadTasks(page: Int) {
+        if (token.isNullOrEmpty()) return
+        isLoading = true
+        try {
+            val authHeader = if (token.startsWith("Bearer ")) token else "Bearer $token"
 
-                // 1. 打印 Token (确保 Token 存在)
-                android.util.Log.d("API_DEBUG", "正在请求任务列表... Token长度: ${token.length}")
+            // 传入当前页码和每页数量
+            val response = NetworkClient.instance.getAllTasks(authHeader, page, pageSize)
 
-                val response = NetworkClient.instance.getAllTasks(authHeader)
-
-                // 2. 打印 HTTP 状态码
-                android.util.Log.d("API_DEBUG", "HTTP状态码: ${response.code()}")
-                android.util.Log.d("API_DEBUG", "请求信息: ${response.raw().request.url}") // 关键：查看最终请求的完整 URL
-
-                if (response.isSuccessful && response.body()?.code == 200) {
-                    val data = response.body()?.data
-                    android.util.Log.d("API_DEBUG", "获取成功，列表数量: ${data?.list?.size}")
-                    tasks = data?.list ?: emptyList()
-                } else {
-                    // 3. 如果是 404，打印错误体看看服务器有没有返回具体信息
-                    val errorBody = response.errorBody()?.string()
-                    android.util.Log.e("API_DEBUG", "请求失败! Code: ${response.code()}")
-                    android.util.Log.e("API_DEBUG", "错误内容: $errorBody")
-
-                    Toast.makeText(context, "获取失败: ${response.code()}", Toast.LENGTH_SHORT).show()
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-                android.util.Log.e("API_DEBUG", "发生异常: ${e.message}")
-                Toast.makeText(context, "网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
-            } finally {
-                isLoading = false
+            if (response.isSuccessful && response.body()?.code == 200) {
+                val data = response.body()?.data
+                tasks = data?.list ?: emptyList()
+                // 读取后端返回的总页数，如果后端没返回 pages，也可以用 (total + pageSize - 1) / pageSize 计算
+                totalPages = data?.pages ?: 1
+            } else {
+                Toast.makeText(context, "获取失败: ${response.code()}", Toast.LENGTH_SHORT).show()
             }
-        } else {
-            android.util.Log.w("API_DEBUG", "Token为空，未发起请求")
+        } catch (e: Exception) {
+            e.printStackTrace()
+            Toast.makeText(context, "网络错误", Toast.LENGTH_SHORT).show()
+        } finally {
+            isLoading = false
         }
     }
-    // 页面内容切换：列表 OR 详情
+
+    // === 4. 【关键】监听 currentPage 变化，页码改变时自动触发请求 ===
+    LaunchedEffect(currentPage) {
+        loadTasks(currentPage)
+    }
+
+    // === 5. 页面内容布局 ===
     Box(modifier = Modifier.fillMaxSize()) {
         if (selectedTask != null) {
             // === 显示详情页 ===
             TaskDetailScreen(
                 task = selectedTask!!,
-                onBack = { selectedTask = null } // 返回列表
+                userPreferences = userPreferences,
+                onBack = { selectedTask = null },
+                onRefresh = {
+                    // 详情页操作成功后，刷新当前页的数据
+                    scope.launch { loadTasks(currentPage) }
+                }
             )
         } else {
-            // === 显示列表页 ===
-            if (isLoading) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator()
+            // === 显示列表页 + 底部翻页栏 ===
+            Column(modifier = Modifier.fillMaxSize()) {
+                // 上半部分：列表区域 (使用 weight 占据所有剩余空间)
+                Box(modifier = Modifier.weight(1f)) {
+                    if (isLoading) {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator()
+                        }
+                    } else if (tasks.isEmpty()) {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text("暂无维修任务", color = Color.Gray)
+                        }
+                    } else {
+                        LazyColumn(
+                            contentPadding = PaddingValues(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                            modifier = Modifier.fillMaxSize()
+                        ) {
+                            items(tasks) { task ->
+                                RepairTaskCard(task = task, onClick = { selectedTask = task })
+                            }
+                        }
+                    }
                 }
-            } else if (tasks.isEmpty()) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("暂无维修任务", color = Color.Gray)
-                }
-            } else {
-                LazyColumn(
-                    contentPadding = PaddingValues(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                    modifier = Modifier.fillMaxSize()
-                ) {
-                    items(tasks) { task ->
-                        RepairTaskCard(task = task, onClick = { selectedTask = task })
+
+                // === 【新增】下半部分：底部翻页控制栏 ===
+                // 只要不是在加载中，且数据不为空，或者总页数大于1时就显示翻页栏
+                if (!isLoading && (tasks.isNotEmpty() || totalPages > 1)) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shadowElevation = 8.dp,
+                        color = Color.White
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .padding(horizontal = 16.dp, vertical = 12.dp)
+                                .fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            // 上一页按钮
+                            OutlinedButton(
+                                onClick = { if (currentPage > 1) currentPage-- },
+                                enabled = currentPage > 1 // 第一页时禁用
+                            ) {
+                                Text("上一页")
+                            }
+
+                            // 中间页码指示器
+                            Text(
+                                text = "第 $currentPage 页 / 共 $totalPages 页",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.DarkGray
+                            )
+
+                            // 下一页按钮
+                            OutlinedButton(
+                                onClick = { if (currentPage < totalPages) currentPage++ },
+                                enabled = currentPage < totalPages // 最后一页时禁用
+                            ) {
+                                Text("下一页")
+                            }
+                        }
                     }
                 }
             }
@@ -2598,42 +3486,657 @@ fun RepairTaskCard(task: RepairTaskItem, onClick: () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun TaskDetailScreen(task: RepairTaskItem, onBack: () -> Unit) {
+fun TaskDetailScreen(
+    task: RepairTaskItem,
+    userPreferences: UserPreferences,
+    onBack: () -> Unit,
+    onRefresh: () -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val token = userPreferences.token ?: ""
+
+    val isAdmin = userPreferences.userRole.equals("admin", ignoreCase = true) ||
+            userPreferences.userRole.equals("super_admin", ignoreCase = true)
+
+    val isVolunteer = userPreferences.userRole == "volunteer"
+    val isVolunteerOrAdmin = isAdmin || isVolunteer
+
+    // 获取当前用户的志愿者 ID
+    val currentVolunteerId = userPreferences.volunteerInfo?.volunteerId
+
+    val isPending = task.status == 0 // 待审核状态
+    val isApproved = task.status == 1 // 审核通过状态（可接取）
+
+    // 判断当前任务是否由当前志愿者接取 (从 repairAssignment 列表中查找)
+    val isMyAcceptedTask = task.status == 2 && currentVolunteerId != null &&
+            task.repairAssignment?.any { it.volunteerId == currentVolunteerId } == true
+
+    // 获取接单的志愿者信息 (取列表第一个作为主要负责人展示)
+    val assignedVolunteer = task.repairAssignment?.firstOrNull()
+
+    // 【新增】：获取最新的维修结单记录
+    val completionLog = task.repairLog?.lastOrNull()
+    val isLeaderOfTask = task.repairAssignment?.any {
+        it.volunteerId == currentVolunteerId && it.isLeader == 1
+    } == true
+
+    // 找出所有状态为 5 (申请中) 的成员
+    val confirmedMembers = task.repairAssignment?.filter { it.status != 5 } ?: emptyList()
+    val pendingApplicants = task.repairAssignment?.filter { it.status == 5 } ?: emptyList()
+
+    val statusText = when (task.status) {
+        0 -> "待审核"
+        1 -> "审核通过"
+        2 -> "已被接收"
+        3 -> "已完成"
+        4 -> "已取消"
+        5 -> "自行解决"
+        6 -> "已被拒绝"
+        7 -> "已评价"
+        else -> "状态${task.status}"
+    }
+
+    val statusColor = when(task.status) {
+        0 -> Color(0xFFFFA000)
+        1, 2 -> Color(0xFF1976D2)
+        3, 7 -> Color(0xFF43A047)
+        6 -> Color(0xFFD32F2F)
+        else -> Color.Gray
+    }
+
+    // 评价弹窗状态
+    var showEvalDialog by remember { mutableStateOf(false) }
+    var evalContent by remember { mutableStateOf("") }
+    var evalScore by remember { mutableIntStateOf(5) } // 默认 5 星
+    var isSubmittingEval by remember { mutableStateOf(false) }
+
+
+
     BackHandler { onBack() }
 
-    Column(modifier = Modifier
-        .fillMaxSize()
-        .background(Color(0xFFF5F5F5))) {
-        androidx.compose.material3.TopAppBar(
-            title = { Text("任务详情 #${task.requestId}") },
-            navigationIcon = {
-                IconButton(onClick = onBack) {
-                    Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+    Scaffold(
+        containerColor = Color(0xFFF5F5F5),
+        bottomBar = {
+            // 【核心修复】：在最外层加一个 Column 占位！
+            // 这能强制 Scaffold 始终正确计算和分配底部栏的高度，解决按钮渲染不出来的系统 Bug。
+            Column(modifier = Modifier.fillMaxWidth()) {
+
+                if (isAdmin && isPending) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shadowElevation = 8.dp,
+                        color = Color.White
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(16.dp).navigationBarsPadding(),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = { handleTaskAudit(task.requestId, 6, token, scope, context, onBack, onRefresh) },
+                                modifier = Modifier.weight(1f),
+                                border = BorderStroke(1.dp, Color(0xFFD32F2F)),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFD32F2F))
+                            ) { Text("拒绝申请") }
+
+                            Button(
+                                onClick = { handleTaskAudit(task.requestId, 1, token, scope, context, onBack, onRefresh) },
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF43A047))
+                            ) { Text("通过审核") }
+                        }
+                    }
                 }
-            },
-            colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.White)
-        )
-        Column(modifier = Modifier
-            .padding(16.dp)
-            .verticalScroll(rememberScrollState())) {
-            Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color.White)) {
+
+                if (isVolunteerOrAdmin && isApproved) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shadowElevation = 8.dp,
+                        color = Color.White
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(16.dp).navigationBarsPadding(),
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Button(
+                                onClick = {
+                                    handleAcceptTask(task.requestId, currentVolunteerId ?: -1, token, scope, context, onBack, onRefresh)
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1976D2))
+                            ) { Text("接取任务", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color.White) }
+                        }
+                    }
+                }
+
+                if (isVolunteerOrAdmin && task.status == 2 && currentVolunteerId != null) {
+                    val isConfirmedMember = task.repairAssignment?.any { it.volunteerId == currentVolunteerId && it.status != 5 } == true
+                    val isPendingApplicant = task.repairAssignment?.any { it.volunteerId == currentVolunteerId && it.status == 5 } == true
+                    var isApplyingLocally by remember { mutableStateOf(false) }
+                    val showAsApplying = isPendingApplicant || isApplyingLocally
+
+                    if (!isConfirmedMember) {
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shadowElevation = 8.dp,
+                            color = Color.White
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(16.dp).navigationBarsPadding(),
+                                horizontalArrangement = Arrangement.Center
+                            ) {
+                                Button(
+                                    onClick = {
+                                        if (!showAsApplying) {
+                                            isApplyingLocally = true
+                                            handleJoinTeam(task.requestId, currentVolunteerId, token, scope, context, onRefresh)
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    enabled = !showAsApplying,
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (showAsApplying) Color(0xFFFBC02D) else Color(0xFF009688),
+                                        disabledContainerColor = Color(0xFFFBC02D).copy(alpha = 0.9f),
+                                        disabledContentColor = Color.White
+                                    )
+                                ) {
+                                    if (showAsApplying) {
+                                        Icon(Icons.Default.AccessTime, contentDescription = null)
+                                        Spacer(Modifier.width(8.dp))
+                                        Text("正在等待负责人查看申请", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                    } else {
+                                        Icon(Icons.Default.GroupAdd, contentDescription = null)
+                                        Spacer(Modifier.width(8.dp))
+                                        Text("加入义修小队", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 👇 【评价按钮】：彻底独立！只要状态是 3 就一定会渲染 👇
+                if (task.status == 3 && false) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shadowElevation = 8.dp,
+                        color = Color.White
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(16.dp).navigationBarsPadding(),
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Button(
+                                onClick = { showEvalDialog = true },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF9800)) // 橙色按钮
+                            ) {
+                                Icon(Icons.Default.Star, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                                Text("评价本次服务", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    ) { innerPadding ->
+        Column(
+
+            modifier = Modifier
+                .padding(innerPadding)
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 16.dp)
+                    .clickable { onBack() },
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Default.ArrowBack,
+                    contentDescription = "返回",
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "返回任务列表 (任务 #${task.requestId})",
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.titleMedium
+                )
+            }
+            // 1. 状态指示器展示
+            Surface(
+                color = statusColor.copy(alpha = 0.1f),
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(modifier = Modifier.size(8.dp).background(statusColor, CircleShape))
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        text = "当前状态：$statusText",
+                        color = statusColor,
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                }
+            }
+
+            // 2. 故障描述卡片
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
+                elevation = CardDefaults.cardElevation(1.dp)
+            ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    Text("故障描述", fontWeight = FontWeight.Bold)
-                    HorizontalDivider(Modifier.padding(vertical = 8.dp))
-                    Text(task.problemDescription ?: "无")
+                    Text("故障描述", style = MaterialTheme.typography.titleSmall, color = Color.Gray)
+                    HorizontalDivider(Modifier.padding(vertical = 8.dp), color = Color(0xFFF5F5F5))
+                    Text(
+                        text = task.problemDescription ?: "无详细描述",
+                        style = MaterialTheme.typography.bodyLarge,
+                        lineHeight = 24.sp
+                    )
                 }
             }
             Spacer(Modifier.height(16.dp))
-            Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color.White)) {
+            //待处理入队申请
+
+            // 3. 详细信息卡片
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
+                elevation = CardDefaults.cardElevation(1.dp)
+            ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    Text("详细信息", fontWeight = FontWeight.Bold)
-                    HorizontalDivider(Modifier.padding(vertical = 8.dp))
-                    Text("设备: ${task.deviceType} ${task.deviceModel}")
-                    Text("系统: ${task.deviceSystem}")
-                    Text("联系人: ${task.realName}")
-                    Text("联系方式: ${task.contactInfo}")
+                    Text("详细信息", style = MaterialTheme.typography.titleSmall, color = Color.Gray)
+                    HorizontalDivider(Modifier.padding(vertical = 8.dp), color = Color(0xFFF5F5F5))
+
+                    DetailItem("设备型号", "${task.deviceType} ${task.deviceModel}")
+                    DetailItem("操作系统", task.deviceSystem ?: "未知")
+                    DetailItem("报修地点", task.repairLocation ?: "未填写")
+                    DetailItem("申请人", task.realName ?: task.username)
+                    DetailItem("联系方式", task.contactInfo ?: "未提供")
+                    DetailItem("申请时间", task.createTime?.replace("T", " ")?.substringBefore(".") ?: "未知")
                 }
             }
+
+
+
+            // 4. 接单员信息卡片 (任务已被接收且有分配记录时显示)
+            // 4. 接单信息卡片 (展示小队所有成员)
+            if (!task.repairAssignment.isNullOrEmpty() && task.status >= 2) {
+                Spacer(Modifier.height(16.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = Color.White),
+                    elevation = CardDefaults.cardElevation(1.dp)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text("接单小队信息", style = MaterialTheme.typography.titleSmall, color = Color.Gray)
+                        HorizontalDivider(Modifier.padding(vertical = 8.dp), color = Color(0xFFF5F5F5))
+
+                        // 1. 渲染正式成员 (status != 5)
+                        val confirmedMembers = task.repairAssignment.filter { it.status != 5 }
+                        confirmedMembers.forEachIndexed { index, assignment ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                AvatarImage(path = assignment.avatar, modifier = Modifier.size(40.dp))
+                                Spacer(Modifier.width(12.dp))
+
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(text = assignment.volunteerName ?: "未知成员", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                                        Spacer(Modifier.width(8.dp))
+                                        val isLeader = assignment.isLeader == 1
+                                        Surface(
+                                            color = if (isLeader) Color(0xFFFF9800).copy(alpha = 0.1f) else Color(0xFF2196F3).copy(alpha = 0.1f),
+                                            shape = RoundedCornerShape(4.dp)
+                                        ) {
+                                            Text(
+                                                text = if (isLeader) "负责人" else "队员",
+                                                color = if (isLeader) Color(0xFFFF9800) else Color(0xFF2196F3),
+                                                fontSize = 10.sp,
+                                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                    }
+                                    Text(text = "${assignment.majorClass ?: ""} ${assignment.grade ?: ""}", color = Color.Gray, fontSize = 12.sp)
+                                }
+                            }
+                            // 只有当后面还有正式成员，或者你是负责人且后面有申请人时，才画线
+                            val pendingApplicants = task.repairAssignment.filter { it.status == 5 }
+                            if (index < confirmedMembers.size - 1 || (isLeaderOfTask && pendingApplicants.isNotEmpty())) {
+                                HorizontalDivider(color = Color(0xFFFAFAFA), thickness = 0.5.dp)
+                            }
+                        }
+
+                        // 2. 渲染待审核申请 (嵌入在同一个卡片内，仅负责人可见)
+                        val pendingApplicants = task.repairAssignment.filter { it.status == 5 }
+                        if (isLeaderOfTask && pendingApplicants.isNotEmpty()) {
+                            Spacer(Modifier.height(8.dp))
+                            pendingApplicants.forEach { applicant ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(Color(0xFFFFF9C4).copy(alpha = 0.3f), RoundedCornerShape(8.dp))
+                                        .padding(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    AvatarImage(path = applicant.avatar, modifier = Modifier.size(32.dp))
+                                    Spacer(Modifier.width(8.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(applicant.volunteerName ?: "申请人", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                                        Text("申请加入小队...", fontSize = 11.sp, color = Color(0xFFFBC02D))
+                                    }
+
+                                    // 同意
+                                    IconButton(onClick = {
+                                        handleJoinRequestAudit(applicant.assignId, true, token, scope, context, onRefresh, onBack)
+                                    }, modifier = Modifier.size(32.dp)) {
+                                        Icon(Icons.Default.CheckCircle, null, tint = Color(0xFF43A047))
+                                    }
+                                    // 拒绝
+                                    IconButton(onClick = {
+                                        handleJoinRequestAudit(applicant.assignId, false, token, scope, context, onRefresh, onBack)
+                                    }, modifier = Modifier.size(32.dp)) {
+                                        Icon(Icons.Default.Cancel, null, tint = Color(0xFFD32F2F))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 5. 【新增】维修结单报告展示区 (仅在任务已完成 status >= 3 且存在结单记录时显示)
+            if (task.status >= 3 && completionLog != null) {
+                Spacer(Modifier.height(16.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = Color.White),
+                    elevation = CardDefaults.cardElevation(1.dp)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text("维修结单报告", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = Color(0xFF2196F3))
+                        HorizontalDivider(Modifier.padding(vertical = 12.dp), color = Color(0xFFEEEEEE))
+
+                        // 展示填写的表单内容
+                        DetailItem("故障原因", completionLog.logContent ?: "未填写")
+                        DetailItem("维修时长", completionLog.repairDuration ?: "未填写")
+                        DetailItem("维修备注", completionLog.solutionSummary ?: "无")
+
+                        // 展示完成时间 (优先使用 task 上的时间)
+                        val finishTime = task.completeTime ?: completionLog.uploadTime
+                        DetailItem("完成时间", finishTime?.replace("T", " ")?.substringBefore(".") ?: "未知")
+
+                        Spacer(Modifier.height(16.dp))
+
+                        // “导入知识库” 预留按钮，仅对管理员和志愿者开放
+                        // “导入知识库” 按钮，仅对管理员和志愿者开放
+                        if (isVolunteerOrAdmin) {
+                            var isImporting by remember { mutableStateOf(false) }
+
+                            OutlinedButton(
+                                onClick = {
+                                    // 1. 校验必填字段
+                                    val logId = completionLog.logId
+                                    if (logId == null) {
+                                        Toast.makeText(context, "未能获取到结单日志ID，无法导入", Toast.LENGTH_SHORT).show()
+                                        return@OutlinedButton
+                                    }
+
+                                    // 优先使用表单填写的故障原因，若没有则用用户申请时的故障描述
+                                    val problemText = completionLog.logContent?.takeIf { it.isNotBlank() }
+                                        ?: task.problemDescription
+                                        ?: "未知故障"
+
+                                    val solutionText = completionLog.repairDuration?.takeIf { it.isNotBlank() }
+                                    if (solutionText == null) {
+                                        Toast.makeText(context, "解决方案为空，无法导入知识库", Toast.LENGTH_SHORT).show()
+                                        return@OutlinedButton
+                                    }
+
+                                    // 2. 发起网络请求
+                                    isImporting = true
+                                    scope.launch {
+                                        try {
+                                            val authHeader = if (token.startsWith("Bearer ")) token else "Bearer $token"
+
+                                            // 按照要求严格构建参数：sourceType = 3，sourceId = "log_X"
+                                            val request = AddKnowledgeRequest(
+                                                problem = problemText,
+                                                solution = solutionText,
+                                                sourceType = 3,
+                                                sourceId = "log_$logId"
+                                            )
+
+                                            // 调用接口 (请确保 NetworkClient.instance 中已经包含了你定义的 addKnowledge 方法)
+                                            val response = NetworkClient.instance.addKnowledge(authHeader, request)
+
+                                            if (response.isSuccessful && response.body()?.code == 200) {
+                                                Toast.makeText(context, "成功导入知识库！这是第${response.body()?.data}条知识", Toast.LENGTH_SHORT).show()
+                                            } else {
+                                                val msg = response.body()?.msg ?: "未知错误"
+                                                Toast.makeText(context, "导入失败: $msg", Toast.LENGTH_SHORT).show()
+                                            }
+                                        } catch (e: Exception) {
+                                            e.printStackTrace()
+                                            Toast.makeText(context, "网络异常，导入失败", Toast.LENGTH_SHORT).show()
+                                        } finally {
+                                            isImporting = false
+                                        }
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                enabled = !isImporting, // 导入中禁用按钮
+                                border = BorderStroke(1.dp, Color(0xFF2196F3)),
+                                colors = ButtonDefaults.outlinedButtonColors(
+                                    contentColor = Color(0xFF2196F3),
+                                    disabledContentColor = Color.Gray
+                                )
+                            ) {
+                                if (isImporting) {
+                                    // 显示加载动画
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(18.dp),
+                                        color = Color(0xFF2196F3),
+                                        strokeWidth = 2.dp
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("正在导入...", fontWeight = FontWeight.Medium)
+                                } else {
+                                    Icon(Icons.Default.Add, contentDescription = "Import", modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("将此方案导入知识库", fontWeight = FontWeight.Medium)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 6. 展示结单填写表单 (仅在“维修中”且“属于当前志愿者的任务”时显示)
+            if (task.status == 2 && isLeaderOfTask && currentVolunteerId != null) {
+                Spacer(Modifier.height(16.dp))
+                TaskCompletionForm(
+                    requestId = task.requestId,
+                    volunteerId = currentVolunteerId,
+                    userToken = token,
+                    onCompleteSuccess = {
+                        onRefresh()
+                        onBack()
+                    }
+                )
+            }
+
+            // 底部留白，防止被导航栏遮挡
+            Spacer(Modifier.height(32.dp))
+        }
+        if (showEvalDialog) {
+            AlertDialog(
+                onDismissRequest = { if (!isSubmittingEval) showEvalDialog = false },
+                title = { Text("服务评价", fontWeight = FontWeight.Bold) },
+                text = {
+                    Column {
+                        Text("请为本次义修服务打分：")
+                        Spacer(modifier = Modifier.height(8.dp))
+                        // 简易星级评分条
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+                            for (i in 1..5) {
+                                IconButton(onClick = { evalScore = i }) {
+                                    Icon(
+                                        imageVector = if (i <= evalScore) Icons.Filled.Star else Icons.Outlined.StarBorder,
+                                        contentDescription = "Star $i",
+                                        tint = if (i <= evalScore) Color(0xFFFFB300) else Color.Gray,
+                                        modifier = Modifier.size(36.dp)
+                                    )
+                                }
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(16.dp))
+                        OutlinedTextField(
+                            value = evalContent,
+                            onValueChange = { evalContent = it },
+                            label = { Text("评价内容 (选填)") },
+                            modifier = Modifier.fillMaxWidth(),
+                            minLines = 3
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            isSubmittingEval = true
+                            scope.launch {
+                                try {
+                                    val request = AddEvaluationRequest(task.requestId, evalContent.ifBlank { "很好" }, evalScore)
+                                    val response = NetworkClient.instance.addEvaluation(token, request)
+                                    if (response.isSuccessful && response.body()?.code == 200) {
+                                        Toast.makeText(context, "评价成功！", Toast.LENGTH_SHORT).show()
+                                        showEvalDialog = false
+                                        onRefresh() // 刷新详情页或列表
+                                        onBack()    // 自动退回历史页面
+                                    } else {
+                                        Toast.makeText(context, "评价失败: ${response.body()?.msg}", Toast.LENGTH_SHORT).show()
+                                    }
+                                } catch (e: Exception) {
+                                    Toast.makeText(context, "提交评价网络异常", Toast.LENGTH_SHORT).show()
+                                } finally {
+                                    isSubmittingEval = false
+                                }
+                            }
+                        },
+                        enabled = !isSubmittingEval
+                    ) {
+                        if (isSubmittingEval) CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White)
+                        else Text("提交评价")
+                    }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = { showEvalDialog = false },
+                        enabled = !isSubmittingEval
+                    ) { Text("取消", color = Color.Gray) }
+                }
+            )
+        }
+    }
+}
+@Composable
+fun DetailItem(label: String, value: String) {
+    Row(modifier = Modifier.padding(vertical = 4.dp)) {
+        Text(text = "$label: ", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
+        Text(text = value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+    }
+}
+
+/**
+ * 审核接口调用逻辑
+ */
+private fun handleTaskAudit(
+    requestId: Int,
+    newStatus: Int,
+    token: String,
+    scope: CoroutineScope,
+    context: Context,
+    onBack: () -> Unit,
+    onRefresh: () -> Unit
+) {
+    val authHeader = if (token.startsWith("Bearer ")) token else "Bearer $token"
+    scope.launch {
+        try {
+            val request = TaskStatusUpdateRequest(
+                requestId = requestId,
+                status = newStatus
+            )
+            // 请确保 NetworkClient 对应的是你新增的接口
+            val response = NetworkClient.instance.updateTaskStatus(authHeader, request)
+            if (response.isSuccessful && response.body()?.code == 200) {
+                Toast.makeText(context, "已成功将任务设置为${if(newStatus==1)"通过" else "拒绝"}", Toast.LENGTH_SHORT).show()
+                onRefresh() // 刷新列表
+                onBack()    // 返回列表页
+            } else {
+                Log.e("AuditError","${response.body()?.msg}")
+                Toast.makeText(context, "操作失败: ${response.body()?.msg}", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: Exception) {
+            Log.e("AuditError", "审核异常: ${e.message}")
+            Toast.makeText(context, "网络异常，请稍后重试", Toast.LENGTH_SHORT).show()
+        }
+    }
+}
+//处理接受任务
+private fun handleAcceptTask(
+    requestId: Int,
+    volunteerId: Int,
+    token: String,
+    scope: CoroutineScope,
+    context: Context,
+    onBack: () -> Unit,
+    onRefresh: () -> Unit
+) {
+
+
+    val authHeader = if (token.startsWith("Bearer ")) token else "Bearer $token"
+
+    scope.launch {
+        try {
+            val request = AddAssignRequest(
+                requestId = requestId,
+                volunteerId = volunteerId, // 将当前的 userId 作为 volunteerId 提交
+                remarks = "无"
+            )
+
+            Log.e("UserId","当前的用户id是：${request.volunteerId}")
+
+            if (volunteerId == -1) {
+                Toast.makeText(context, "用户状态异常，请重新登录", Toast.LENGTH_SHORT).show()
+            }
+
+            val response = NetworkClient.instance.addAssign(authHeader, request)
+
+            if (response.isSuccessful && response.body()?.code == 200) {
+                Log.e("TaskAccept","${response.body()?.msg}")
+                Toast.makeText(context, "接取成功", Toast.LENGTH_SHORT).show()
+                onRefresh() // 刷新列表
+                onBack()    // 自动跳回列表页面
+            } else {
+                Toast.makeText(context, "接取失败: ${response.body()?.msg}", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: Exception) {
+            Log.e("AcceptTaskError", "接取异常: ${e.message}")
+            Toast.makeText(context, "网络异常，请稍后重试", Toast.LENGTH_SHORT).show()
         }
     }
 }
@@ -2650,19 +4153,6 @@ fun DetailSection(title: String, content: @Composable ColumnScope.() -> Unit) {
             HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp), color = Color(0xFFEEEEEE))
             content()
         }
-    }
-}
-
-@Composable
-fun DetailItem(label: String, value: String?) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp),
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Text(label, color = Color.Gray, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
-        Text(value ?: "-", color = Color.Black, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(2f), textAlign = TextAlign.End)
     }
 }
 
@@ -2736,122 +4226,125 @@ fun NotificationCard(item: NotifyItem, onClick: () -> Unit) {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun NotificationDetailScreen(
     notification: NotifyItem,
     onBack: () -> Unit
 ) {
-    // 拦截返回键
+    // 拦截系统返回键（侧滑/实体键）
     BackHandler { onBack() }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("消息详情") },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.White)
-            )
-        },
-        containerColor = Color(0xFFF5F5F5)
-    ) { innerPadding ->
-        Column(
+    // 【核心修改】：直接移除 Scaffold，使用 Column 作为根布局
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFFF5F5F5)) // 把原本 Scaffold 的背景色移到这里
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp)
+    ) {
+        Row(
             modifier = Modifier
-                .padding(innerPadding)
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(16.dp)
+                .fillMaxWidth()
+                .padding(bottom = 16.dp) // 与下方卡片保持间距
+                .clickable { onBack() }, // 点击触发状态改变，回到列表
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            // 头部信息卡片
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Color.White),
-                modifier = Modifier.fillMaxWidth(),
-                elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
-            ) {
-                Column(modifier = Modifier.padding(20.dp)) {
-                    // 类型标签
-                    Surface(
-                        color = when (notification.type) {
-                            "SYSTEM" -> MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)
-                            "BROADCAST" -> Color(0xFFFFA000).copy(alpha = 0.1f)
-                            else -> Color.Gray.copy(alpha = 0.1f)
-                        },
-                        shape = RoundedCornerShape(4.dp)
-                    ) {
-                        Text(
-                            text = when (notification.type) {
-                                "SYSTEM" -> "系统通知"
-                                "BROADCAST" -> "全员广播"
-                                "USER" -> "用户私信"
-                                else -> "通知"
-                            },
-                            style = MaterialTheme.typography.labelMedium,
-                            color = when (notification.type) {
-                                "SYSTEM" -> MaterialTheme.colorScheme.primary
-                                "BROADCAST" -> Color(0xFFFFA000)
-                                else -> Color.Gray
-                            },
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(12.dp))
-
+            Icon(
+                imageVector = Icons.Default.ArrowBack,
+                contentDescription = "返回",
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(18.dp)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = "返回消息列表",
+                color = MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.Bold,
+                style = MaterialTheme.typography.titleSmall
+            )
+        }
+        // 头部信息卡片
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color.White),
+            modifier = Modifier.fillMaxWidth(),
+            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+        ) {
+            Column(modifier = Modifier.padding(20.dp)) {
+                // 类型标签
+                Surface(
+                    color = when (notification.type) {
+                        "SYSTEM" -> MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)
+                        "BROADCAST" -> Color(0xFFFFA000).copy(alpha = 0.1f)
+                        else -> Color.Gray.copy(alpha = 0.1f)
+                    },
+                    shape = RoundedCornerShape(4.dp)
+                ) {
                     Text(
-                        text = notification.title,
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold
+                        text = when (notification.type) {
+                            "SYSTEM" -> "系统通知"
+                            "BROADCAST" -> "全员广播"
+                            "USER" -> "用户私信"
+                            else -> "通知"
+                        },
+                        style = MaterialTheme.typography.labelMedium,
+                        color = when (notification.type) {
+                            "SYSTEM" -> MaterialTheme.colorScheme.primary
+                            "BROADCAST" -> Color(0xFFFFA000)
+                            else -> Color.Gray
+                        },
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                     )
+                }
 
-                    Spacer(modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.height(12.dp))
 
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.AccessTime, null, modifier = Modifier.size(14.dp), tint = Color.Gray)
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = notification.createTime.replace("T", " "),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Color.Gray
-                        )
-                        Spacer(modifier = Modifier.width(16.dp))
-                        Icon(Icons.Default.Person, null, modifier = Modifier.size(14.dp), tint = Color.Gray)
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = notification.senderUsername ?: "系统管理员",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Color.Gray
-                        )
-                    }
+                Text(
+                    text = notification.title,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.AccessTime, null, modifier = Modifier.size(14.dp), tint = Color.Gray)
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = notification.createTime.replace("T", " "),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Gray
+                    )
+                    Spacer(modifier = Modifier.width(16.dp))
+                    Icon(Icons.Default.Person, null, modifier = Modifier.size(14.dp), tint = Color.Gray)
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = notification.senderUsername ?: "系统管理员",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Gray
+                    )
                 }
             }
+        }
 
-            Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(16.dp))
 
-            // 内容卡片
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Color.White),
-                modifier = Modifier.fillMaxWidth(),
-                elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
-            ) {
-                Column(modifier = Modifier.padding(20.dp)) {
-                    Text(
-                        text = notification.content,
-                        style = MaterialTheme.typography.bodyLarge,
-                        lineHeight = 24.sp,
-                        color = Color(0xFF333333)
-                    )
-
-                    // 如果有链接可以显示链接部分（此处略）
-                }
+        // 内容卡片
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color.White),
+            modifier = Modifier.fillMaxWidth(),
+            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+        ) {
+            Column(modifier = Modifier.padding(20.dp)) {
+                Text(
+                    text = notification.content,
+                    style = MaterialTheme.typography.bodyLarge,
+                    lineHeight = 24.sp,
+                    color = Color(0xFF333333)
+                )
             }
         }
     }
 }
-
 
 @Composable
 private fun ChatBubble(message: ChatMessage) {
@@ -2903,3 +4396,187 @@ fun DefaultPreview() {
     }
 }
 
+//用于控制任务完成
+@Composable
+fun TaskCompletionForm(
+    requestId: Int,
+    volunteerId: Int,
+    userToken: String,
+    onCompleteSuccess: () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    // --- 定义用户需要填写的表单状态 (请根据实际情况增删) ---
+    var faultReason by remember { mutableStateOf("") }
+    var solution by remember { mutableStateOf("") }
+    var remarks by remember { mutableStateOf("") }
+
+    var isSubmitting by remember { mutableStateOf(false) }
+
+    // 【核心逻辑】只有所有必填项都不为空白时，才允许点击完成按钮
+    val isFormValid = faultReason.isNotBlank() && solution.isNotBlank() && remarks.isNotBlank()
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(16.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        elevation = CardDefaults.cardElevation(4.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp)
+        ) {
+            Text(
+                text = "填写维修结单报告",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFF2196F3),
+                modifier = Modifier.padding(bottom = 16.dp)
+            )
+
+            // 1. 故障原因输入框
+            OutlinedTextField(
+                value = faultReason,
+                onValueChange = { faultReason = it },
+                label = { Text("维修日志") },
+                placeholder = { Text("请输入本次任务内容") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = false
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // 2. 解决方案输入框
+            OutlinedTextField(
+                value = solution,
+                onValueChange = { solution = it },
+                label = { Text("维修时长") },
+                placeholder = { Text("请描述您的维修进行的时长") },
+                modifier = Modifier.fillMaxWidth().height(100.dp),
+                singleLine = false
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // 3. 备注/建议输入框
+            OutlinedTextField(
+                value = remarks,
+                onValueChange = { remarks = it },
+                label = { Text("维修方案") },
+                placeholder = { Text("例如：按正常顺序贴完手机膜") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = false
+            )
+            Spacer(modifier = Modifier.height(24.dp))
+
+            // 4. 提交按钮
+            Button(
+                onClick = {
+                    isSubmitting = true
+                    scope.launch {
+                        try {
+                            val authHeader = if (userToken.startsWith("Bearer ")) userToken else "Bearer $userToken"
+                            // 构造请求，requestId 和 volunteerId 由外部传入，对用户透明
+                            val request = CompleteTaskRequest(
+                                requestId = requestId,
+                                volunteerId = volunteerId,
+                                logContent = faultReason,
+                                repairDuration = solution,
+                                solutionSummary = remarks
+                            )
+
+                            // 发起网络请求 (请确保 NetworkClient.instance 中包含了 ApiService 实例)
+                            val response = NetworkClient.instance.completeRepairTask(authHeader, request)
+
+                            if (response.isSuccessful && response.body()?.code == 200) {
+                                Toast.makeText(context, "结单成功！", Toast.LENGTH_SHORT).show()
+                                onCompleteSuccess() // 触发成功回调（例如：刷新页面或返回上一页）
+                            } else {
+                                val errorMsg = response.body()?.msg ?: "未知错误"
+                                val errorCode = response.body()?.code
+                                Log.e("TaskDebug","出现错误：${errorMsg},${errorCode}")
+                                Toast.makeText(context, "结单失败: $errorMsg", Toast.LENGTH_SHORT).show()
+                            }
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                            Toast.makeText(context, "网络异常，请重试", Toast.LENGTH_SHORT).show()
+                        } finally {
+                            isSubmitting = false
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+                enabled = isFormValid && !isSubmitting, // 表单不完整或正在提交时禁用按钮
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                if (isSubmitting) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp), color = Color.White)
+                } else {
+                    Text("完成任务", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 申请加入义修小队逻辑
+ */
+private fun handleJoinTeam(
+    requestId: Int,
+    volunteerId: Int,
+    token: String,
+    scope: CoroutineScope,
+    context: Context,
+    onRefresh: () -> Unit
+) {
+    val authHeader = if (token.startsWith("Bearer ")) token else "Bearer $token"
+    scope.launch {
+        try {
+            val request = AddJoinRequest(volunteerId = volunteerId, requestId = requestId)
+            // 调用接口
+            NetworkClient.instance.addJoinRequest(authHeader, request)
+            // 由于该接口定义的返回值为 Unit，我们直接提示成功并刷新
+            Toast.makeText(context, "申请加入成功！", Toast.LENGTH_SHORT).show()
+            onRefresh()
+        } catch (e: Exception) {
+            Log.e("JoinTeamError", "异常: ${e.message}")
+            Toast.makeText(context, "操作失败，请重试", Toast.LENGTH_SHORT).show()
+        }
+    }
+}
+
+// MainActivity 类级别的处理加入小队请求方法
+private fun handleJoinRequestAudit(
+    assignId: Int,
+    isApprove: Boolean,
+    token: String,
+    scope: CoroutineScope,
+    context: Context,
+    onRefresh: () -> Unit,
+    onBack: () -> Unit // 【新增参数】用于控制返回
+) {
+    val authHeader = if (token.startsWith("Bearer ")) token else "Bearer $token"
+    scope.launch {
+        try {
+            val response = if (isApprove) {
+                NetworkClient.instance.approveJoinRequest(authHeader, ApproveJoinRequest(assignId))
+            } else {
+                NetworkClient.instance.rejectJoinRequest(authHeader, RejectJoinRequest(assignId, "名额已满"))
+            }
+
+            if (response.isSuccessful && response.body()?.code == 200) {
+                Toast.makeText(context, if (isApprove) "已通过申请" else "已拒绝申请", Toast.LENGTH_SHORT).show()
+
+                // 【核心修改】先触发刷新，再执行返回
+                onRefresh()
+                onBack()
+            } else {
+                Toast.makeText(context, "操作失败: ${response.body()?.msg}", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: Exception) {
+            Toast.makeText(context, "网络异常", Toast.LENGTH_SHORT).show()
+        }
+    }
+}

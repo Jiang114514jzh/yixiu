@@ -10,6 +10,7 @@ import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.Multipart
 import retrofit2.http.Body
+import retrofit2.http.DELETE
 import retrofit2.http.GET
 import retrofit2.http.Header
 import retrofit2.http.POST
@@ -29,7 +30,7 @@ data class NotifyItem(
     val content: String,        // 恢复为 String (不可空)
     val link: String?,
     val type: String,           // 恢复为 String
-    val isRead: Int,            // 恢复为 Int
+    val isRead: Int? = null,            // 恢复为 Int
     val senderUsername: String?,
     val senderAvatar: String?,
     val createTime: String      // 恢复为 String
@@ -55,37 +56,73 @@ data class VolunteerRegisterRequest(
 
 // ==================== 数据模型更新 ====================
 
-//1. 对应 JSON 中 data 里面的 list 的每一项
+// 1. 新增：维修分配信息的数据类
+data class RepairAssignment(
+    val assignId: Int,
+    val requestId: Int,
+    val volunteerId: Int,
+    val volunteerName: String?,
+    val majorClass: String?,
+    val grade: String?,
+    val contactType: Int?,
+    val contactNumber: String?,
+    val avatar: String?,
+    val isLeader: Int?,
+    val assignedTime: String?,
+    val status: Int?,
+    val remarks: String?,
+    val updateTime: String?
+)
+
+// 2. 修改：原本的 RepairTaskItem 类
 data class RepairTaskItem(
-    val requestId: Int,             // 申请编号 (原 id)
+    val requestId: Int,
     val userId: Int,
-    val username: String,           // 用户账号
-    val realName: String?,          // 真实姓名 (上传用户)
+    val username: String,
+    val realName: String?,
     val contactType: String?,
     val contactInfo: String?,
     val deviceType: String?,
     val deviceSystem: String?,
     val deviceModel: String?,
-    val problemDescription: String?, // 问题描述
+    val problemDescription: String?,
     val campus: String?,
-    val repairLocation: String?,     // 维修地点
-    val appointmentTime: String?,    // 预约时间
+    val repairLocation: String?,
+    val appointmentTime: String?,
     val remarks: String?,
-    val status: Int,                 // 状态 0-7
-    val imgUrl: List<String>?,       // 图片可能是一个列表
-    val createTime: String?,         // 创建时间
+    val status: Int,
+    val imgUrl: List<String>?,
+    // 【核心新增字段】：接收后端的分配列表
+    val repairAssignment: List<RepairAssignment>? = null,
+    val repairLog: List<RepairLog>? = null,
+    val createTime: String?,
     val updateTime: String?,
-    val completeTime: String?
+    val completeTime: String?        // 【重要】：完成时间
 )
 
-// 2. 对应 JSON 中的 data 对象 (包含 list 和分页信息)
+
+// 1. 新增结单日志数据类 (字段名请根据你后端的实际情况调整)
+data class RepairLog(
+    val logId: Int?,
+    val requestId: Int,
+    val volunteerId: Int,
+    val volunteerName: String?,
+    val logContent: String?, // 故障原因
+    val repairDuration: String?,    // 解决方案
+    val solutionSummary: String?,     // 备注
+    val uploadTime: String?,
+    val importStatus: Int?,
+    val logImgUrl: List<String>?
+)
 
 
+// 在 ApiService.kt 中找到这部分并修改
 data class RepairTaskListData(
     val total: Int,
     val list: List<RepairTaskItem>,
     val pageNum: Int,
-    val pageSize: Int
+    val pageSize: Int,
+    val pages: Int // 【新增】加入总页数字段，对应后端返回的 "pages": 3
 )
 
 data class MarkReadRequest(
@@ -105,6 +142,8 @@ data class VolunteerUpdateRequest(
     val contactType: Int,
     val contactNumber: String
 )
+
+
 //============ 接口定义 ============
 interface ApiService {
     // --- 登录注册相关接口 ---
@@ -120,12 +159,12 @@ interface ApiService {
     ): Response<ApiResponse<Any>>
 
     // 修改基本信息 (PUT)
-    @PUT("users/userInfo")
-    suspend fun updateBasicInfo(@Body request: UserUpdateRequest): ApiResponse<Unit>
+    @PUT("/api/v1/users/userInfo")
+    suspend fun updateBasicInfo(@Body request: UserUpdateRequest): ApiResponse<Any>
 
     // 修改志愿者信息 (PUT 或 POST，根据后端定义，这里默认为修改操作)
-    @PUT("volunteer/info")
-    suspend fun updateVolunteerInfo(@Body request: VolunteerUpdateRequest): ApiResponse<Unit>
+    @PUT("/api/v1/volunteer/info")
+    suspend fun updateVolunteerInfo(@Body request: VolunteerUpdateRequest): ApiResponse<Any>
 
     @POST("/api/v1/users/loginByEmail")
     suspend fun loginByEmail(@Body body: EmailRegisterOrLoginRequest): Response<ApiResponse<Any>>
@@ -133,6 +172,14 @@ interface ApiService {
     // --- 报修任务相关接口 ---
     @POST("/api/v1/task/add")
     suspend fun submitRepairTask(@Body task: RepairTaskRequest): Response<ApiResponse<Any>>
+
+    // 【新增】：获取当前用户的维修历史记录
+    @GET("/api/v1/task/getByUserId")
+    suspend fun getMyRepairHistory(
+        @Header("Authorization") token: String,
+        @Query("pageNum") pageNum: Int = 1,
+        @Query("pageSize") pageSize: Int = 50
+    ): Response<ApiResponse<RepairTaskListData>>
 
     @GET("/api/v1/users/userInfo")
     suspend fun getUserInfo(): Response<ApiResponse<UserInfo>>
@@ -146,12 +193,16 @@ interface ApiService {
         @Query("pageNum") pageNum: Int,
         @Query("pageSize") pageSize: Int
     ): Response<ApiResponse<NotifyPage>>
+
     @POST("/api/v1/volunteer/registerByEmail")
     suspend fun registerVolunteer(@Body body: VolunteerRegisterRequest): Response<ApiResponse<Any>>
+    // 在 ApiService.kt 的 interface ApiService 中
     @GET("/api/v1/task/getAll")
-    // ✅ 正确：返回 ApiResponse 包装类
-    suspend fun getAllTasks(@Header("Authorization") token: String): Response<ApiResponse<RepairTaskListData>>
-
+    suspend fun getAllTasks(
+        @Header("Authorization") token: String,
+        @Query("pageNum") pageNum: Int,    // 【新增】
+        @Query("pageSize") pageSize: Int   // 【新增】
+    ): Response<ApiResponse<RepairTaskListData>>
     @GET("/api/v1/notify/poll")
     suspend fun pollNotifications(@Header("Authorization") token: String): Response<PollResponse>
 
@@ -215,14 +266,14 @@ interface ApiService {
     suspend fun addComment(
         @Header("Authorization") token: String,
         @Body request: AddCommentRequest
-    ): Response<ApiResponse<Any>>
+    ): Response<ApiResponse<AddCommentResponseData>>
 
     // 2. 添加回复 (包括回复主评论、回复子评论)
     @POST("/api/v1/community/comment/addReply")
     suspend fun addReply(
         @Header("Authorization") token: String,
         @Body request: AddReplyRequest
-    ): Response<ApiResponse<Any>>
+    ): Response<ApiResponse<AddReplyResponse>>
 
     // 3. 点赞评论/回复 (预留)
     @POST("/api/v1/community/comment/modifyCommentLike")
@@ -247,6 +298,167 @@ interface ApiService {
         @Query("pageNum") pageNum: Int = 1,
         @Query("pageSize") pageSize: Int = 20
     ): Response<ApiResponse<ReplyPage>>
+
+    @DELETE("/api/v1/community/post/delete")
+    suspend fun deletePost(
+        @Header("Authorization") token: String,
+        @Query("postId") postId: Int
+    ): Response<ApiResponse<Any>>
+
+    // 发送删除通知
+    @POST("/api/v1/notify/systemToUser")
+    suspend fun sendDeleteNotification(
+        @Header("Authorization") token: String,
+        @Body request: SendDeleteNotifyRequest
+    ): Response<ApiResponse<Any>>
+
+    @GET("/api/v1/volunteer/infoListExcludeUserId")
+    suspend fun getVolunteerList(
+        @Header("Authorization") token: String,
+        @Query("pageNum") pageNum: Int,
+        @Query("pageSize") pageSize: Int
+    ): Response<ApiResponse<VolunteerPageResponse>> // 引用当前文件的类
+
+    @POST("/api/v1/admin/volunteerInfo")
+    suspend fun updateVolunteerInfo(
+        @Header("Authorization") token: String,
+        @Body info: VolunteerDetail // 引用当前文件的类
+    ): Response<ApiResponse<Unit>>
+
+    @PUT("/api/v1/task/updateStatus")
+    suspend fun updateTaskStatus(
+        @Header("Authorization") token: String,
+        @Body request: TaskStatusUpdateRequest
+    ): Response<ApiResponse<Any>>
+
+    // 2. 在 interface ApiService 中添加接口
+    @POST("/api/v1/task/addAssign")
+    suspend fun addAssign(
+        @Header("Authorization") token: String,
+        @Body request: AddAssignRequest
+    ): Response<ApiResponse<Any>>
+
+    @GET("/api/v1/ai/allKnowledge") // 请根据真实后端路径修改
+    suspend fun getKnowledgeList(@Header("Authorization") token: String): Response<KnowledgeResponse>
+
+    @POST("/api/v1/task/addLog") // 请替换为实际的结单接口路径
+    suspend fun completeRepairTask(
+        @Header("Authorization") token: String,
+        @Body request: CompleteTaskRequest
+    ): Response<ApiResponse<Any>>
+
+    @POST("/api/v1/ai/knowledge")
+    suspend fun addKnowledge(
+        @Header("Authorization") token: String,
+        @Body request: AddKnowledgeRequest
+    ): Response<ApiResponse<Any>>
+
+    @POST("/api/v1/notify/comment")
+    suspend fun sendCommentNotification(
+        @Header("Authorization") token: String,
+        @Body request: SendCommentNotifyRequest
+    ): Response<ApiResponse<AddCommentResponseData>>
+
+    @POST("/api/v1/notify/replyToReply")
+    suspend fun sendReplyToReplyNotification(
+        @Header("Authorization") token: String,
+        @Body request: SendReplyToReplyNotifyRequest
+    ): Response<ApiResponse<Any>>
+
+    //回复评论
+    @POST("/api/v1/notify/replyToComment")
+    suspend fun sendReplyToCommentNotification(
+        @Header("Authorization") token: String,
+        @Body request: SendReplyToCommentNotifyRequest
+    ): Response<ApiResponse<Any>>
+
+    //删除知识库内容
+    @DELETE("/api/v1/ai/deleteKnowledge")
+    suspend fun deleteKnowledge(
+        @Header("Authorization") token: String,
+        @Query("knowledgeId") knowledgeId: Int
+    ): Response<ApiResponse<Any>>
+
+    //修改知识库内容
+    @PUT("/api/v1/ai/updateKnowledge")
+    suspend fun updateKnowledge(
+        @Header("Authorization") token: String,
+        @Body request: UpdateKnowledgeRequest
+    ): Response<ApiResponse<Any>>
+
+    @POST("/api/v1/task/applyToJoin")
+    suspend fun addJoinRequest(
+        @Header("Authorization") token: String,
+        @Body request: AddJoinRequest
+    )
+
+    @PUT("/api/v1/task/approveTaskApply")
+    suspend fun approveJoinRequest(
+        @Header("Authorization") token: String,
+        @Body request: ApproveJoinRequest
+    ): Response<ApiResponse<Any>>
+
+    @PUT("/api/v1/task/rejectTaskApply")
+    suspend fun rejectJoinRequest(
+        @Header("Authorization") token: String,
+        @Body request: RejectJoinRequest
+    ): Response<ApiResponse<Any>>
+
+    @GET("api/v1/task/getMyTaskByVolunteerId")
+    suspend fun getMyTaskByVolunteerId(
+        @Header("Authorization") token: String,
+        @Query("pageNum") pageNum: Int,
+        @Query("pageSize") pageSize: Int
+    ): Response<ApiResponse<RepairTaskListData>>
+
+    //关注用户
+    @Multipart
+    @POST("/api/v1/users/follow")
+    suspend fun followUser(
+        @Header("Authorization") token: String,
+        @Part("followeeId") followeeId: Int // 【关键】：这里必须从 @Field 改为 @Part
+    ): Response<ApiResponse<Any>>
+
+    // 取消关注用户 (完美还原 Apifox 的 form-data 格式)
+    @Multipart
+    @POST("/api/v1/users/cancelFollow")
+    suspend fun cancelFollowUser(
+        @Header("Authorization") token: String,
+        @Part("followeeId") followeeId: Int // 【关键】：这里必须从 @Field 改为 @Part
+    ): Response<ApiResponse<Any>>
+
+    @GET("/api/v1/users/profile")
+    suspend fun getUserProfile(
+        @Header("Authorization") token: String,
+        @Query("userId") userId: Int
+    ): Response<ApiResponse<UserProfile>>
+
+    //获取关注列表
+    @GET("/api/v1/users/followListByFilter")
+    suspend fun getFollowList(
+        @Header("Authorization") token: String,
+        @Query("pageNum") pageNum: Int = 1,
+        @Query("pageSize") pageSize: Int = 50,
+        @Query("keyword") keyword: String = "",
+        @Query("status") status: Int = 1
+    ): Response<ApiResponse<FollowPage>>
+
+    // 删除评论或回复
+    @FormUrlEncoded
+    @PUT("/api/v1/community/comment/delete")
+    suspend fun deleteComment(
+        @Header("Authorization") token: String,
+        @Field("commentId") commentId: Int? = null,
+        @Field("replyId") replyId: Int? = null
+    ): Response<ApiResponse<Any>>
+
+    // 2. 在 ApiService 接口中添加方法 (注意替换为你实际的返回类型 ApiResponse)
+    @POST("/api/v1/task/addEvaluation")
+    suspend fun addEvaluation(
+        @Header("Authorization") token: String,
+        @Body request: AddEvaluationRequest
+    ): Response<ApiResponse<Any>> // 返回 Any 防止 Gson 解析 null 报错
+
 }
 
 //============ Retrofit 客户端实例 ============
@@ -437,3 +649,143 @@ data class ReplyPage(
     val total: Int,
     val list: List<PostReply>
 )
+
+data class VolunteerDetail(
+    val volunteerId: Int,
+    val userId: Int,
+    val studentNumber: String?,
+    val majorClass: String?,
+    val grade: String?,
+    val status: Int,
+    val contactType: Int?,
+    val contactNumber: String?
+)
+
+// 3. 用户与志愿者信息包装
+data class VolunteerUserItem(
+    val userId: Int,
+    val username: String,
+    val realName: String?,
+    val avatar: String?,
+    val role: String,
+    val volunteerInfo: VolunteerDetail?
+)
+
+// 通知请求体
+data class SendDeleteNotifyRequest(
+    val title: String,
+    val receiverId: Int,
+    val content: String
+)
+
+// 4. 列表响应
+data class VolunteerPageResponse(
+    val list: List<VolunteerUserItem>,
+    val total: Int,
+    // 如果需要其他分页字段可以继续添加
+)
+
+data class TaskStatusUpdateRequest(
+    val requestId: Int,
+    val status: Int
+)
+
+// 1. 添加接取任务的请求体 (可以放在文件末尾或其他数据类聚集的地方)
+data class AddAssignRequest(
+    val requestId: Int,
+    val volunteerId: Int,
+    val remarks: String = "无" // 默认备注为空或"无"
+)
+
+// 对应 JSON 中的 "data" 里面的每一项
+data class KnowledgeItem(
+    val knowledgeId: Int,
+    val sourceType: Int?,       // JSON中有数字 3 等
+    val sourceId: String?,      // JSON中有 null 或者 "log_19"，所以必须是 String?
+    val problem: String,
+    val solution: String,
+    val status: Int,
+    val hitCount: Int?,         // JSON中有 null，所以必须是 Int?
+    val createTime: String?,    // 例如 "2026-02-05T13:54:32.000+00:00"
+    val updateTime: String?     // 替换了之前的 uploadTime
+)
+
+data class KnowledgeResponse(
+    val code: Int,
+    val msg: String,
+    val data: List<KnowledgeItem>
+)
+
+// 1. 定义完成任务的请求体 (假设字段为：故障原因、解决方案、备注)
+data class CompleteTaskRequest(
+    val requestId: Int,
+    val volunteerId: Int,
+    // 下面这三个字段请替换为你“图中”实际需要的字段名
+    val logContent: String,
+    val repairDuration: String,
+    val solutionSummary: String
+)
+
+data class AddKnowledgeRequest(
+    val problem: String,
+    val solution: String,
+    val sourceType : Int,
+    val sourceId : String
+)
+
+data class SendCommentNotifyRequest(
+    val commentId: Int,
+    val postId : Int,
+    val commentContent : String
+)
+data class AddCommentResponseData(
+    val commentId: Int
+)
+
+data class AddReplyResponse(
+    val replyId: Int
+)
+
+data class SendReplyToReplyNotifyRequest(
+    val replyId: Int,
+    val commentId : Int,
+    val postId : Int,
+    val replyContent : String,
+    val parentReplyId : String
+)
+
+data class SendReplyToCommentNotifyRequest(
+    val replyId: Int,
+    val commentId : Int,
+    val postId : Int,
+    val replyContent : String
+)
+
+data class UpdateKnowledgeRequest(
+    val knowledgeId: Int,
+    val problem: String,
+    val solution: String,
+    val status : Int
+)
+
+data class AddJoinRequest(
+    val volunteerId: Int,
+    val requestId: Int
+)
+
+data class ApproveJoinRequest(
+    val assignId: Int
+)
+
+data class RejectJoinRequest(
+    val assignId: Int,
+    val reason: String
+)
+
+// 1. 定义请求体数据类
+data class AddEvaluationRequest(
+    val requestId: Int,
+    val content: String,
+    val score: Int
+)
+

@@ -1,7 +1,7 @@
 package com.example.yixiu_1.network
 
+import android.util.Log
 import com.google.gson.annotations.SerializedName
-import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Response
@@ -30,6 +30,10 @@ data class DoubaoMessage(
     val role: String?
 )
 
+data class ChatSessionData(
+    // 必须确保这里的变量名和 JSON 里的 key 完全一致
+    val conversationId: Int
+)
 
 
 data class DoubaoContent(
@@ -65,15 +69,83 @@ data class DoubaoUsage(
 )
 
 /**
+ * 对应后端返回的最外层包装
+ */
+data class HistoryResponse(
+    val code: Int,
+    val msg: String,
+    val data: HistoryPageData? // 注意：这里 data 对应的是包含 list 的对象
+)
+
+/**
+ * 对应 JSON 中的 "data" 字段，包含分页信息
+ */
+data class HistoryPageData(
+    val total: Int,
+    val list: List<HistoryMessage>?, // 这里的 list 才是我们要的消息数组
+    val pageNum: Int,
+    val pageSize: Int,
+    val pages: Int
+    // 其他字段如 startRow, endRow 等如果不使用可以不写，Gson 会自动忽略
+)
+
+/**
+ * 对应 "list" 数组中的每一项
+ */
+data class HistoryMessage(
+    val messageId: Int,
+    val conversationId: Int,
+    val role: String,     // "user" 或 "assistant"
+    val content: String,  // 聊天内容
+    val createTime: String // 时间字符串
+)
+
+data class HistoryData(
+    val list: List<HistoryMessage>
+)
+
+/**
+ * 1. 添加会话接口的响应
+ */
+data class AddSessionResponse(
+    val code: Int,
+    val msg: String,
+    val data: SessionIdData?
+)
+
+data class SessionIdData(
+    val conversationId: Int
+)
+
+/**
+ * 2. 获取会话列表接口的响应 (对应你发的第二张图)
+ */
+data class ChatSessionResponse(
+    val code: Int,
+    val msg: String,
+    val data: ChatSessionPageData?
+)
+
+data class ChatSessionPageData(
+    val total: Int,
+    val list: List<ChatSessionItem>?,
+    val pageNum: Int,
+    val pageSize: Int,
+    val pages: Int
+)
+
+data class ChatSessionItem(
+    val conversationId: Int,
+    val userId: Int,
+    val headline: String,
+    val status: Int,
+    val createTime: String
+)
+/**
  * 豆包API服务接口
  */
 interface DoubaoApiService {
-    /**
-     * 调用豆包聊天完成API
-     * @param authorization 认证令牌
-     * @param request 请求体
-     * @return API响应
-     */
+    // 1. 豆包官方接口 (使用 Bearer APIKey)
     @POST("/api/v3/chat/completions")
     suspend fun chatCompletion(
         @Header("Authorization") authorization: String,
@@ -81,17 +153,38 @@ interface DoubaoApiService {
         @Body request: DoubaoChatRequest
     ): Response<DoubaoChatResponse>
 
-    /**
-     * 上传图片到豆包服务（如果需要的话）
-     */
-    @Multipart
-    @POST("/api/v1/upload")
-    suspend fun uploadImage(
-        @Header("Authorization") authorization: String,
-        @Part file: MultipartBody.Part
+    // 2. 你的后端接口 - 保存聊天记录 (注入 Authorization Header)
+    @POST("http://8.148.253.180:8080/api/v1/ai/addChatMessage")
+    suspend fun saveChatMessage(
+        @Header("Authorization") token: String,
+        @Body request: Map<String, @JvmSuppressWildcards Any>
     ): Response<Any>
-}
 
+    // 3. 你的后端接口 - 获取历史记录 (注入 Authorization Header)
+    @GET("http://8.148.253.180:8080/api/v1/ai/chatMessage")
+    suspend fun getChatHistory(
+        @Header("Authorization") token: String,
+        @Query("conversationId") conversationId: Int,
+        @Query("pageNum") pageNum: Int = 1,
+        @Query("pageSize") pageSize: Int = 10
+    ): Response<HistoryResponse>
+
+    @POST("http://8.148.253.180:8080/api/v1/ai/addChatSession")
+    suspend fun addChatSession(
+        @Header("Authorization") token: String,
+        @Query("headline") headline: String  // 关键修改：从 @Body Map 改为 @Query
+    ): Response<AddSessionResponse>
+
+    /**
+     * 【获取会话列表接口】用于加载当前用户的所有历史会话
+     */
+    @GET("http://8.148.253.180:8080/api/v1/ai/chatSession")
+    suspend fun getChatSessions(
+        @Header("Authorization") token: String,
+        @Query("pageNum") pageNum: Int = 1,
+        @Query("pageSize") pageSize: Int = 20
+    ): Response<ChatSessionResponse>
+}
 /**
  * 豆包API客户端管理对象
  */
@@ -147,109 +240,113 @@ object DoubaoApiClient {
  * 豆包API工具类，提供便捷的调用方法
  */
 class DoubaoApiHelper {
-
-    /**
-     * 发送文本消息到豆包API
-     * @param message 文本消息内容
-     * @param model 模型名称，默认为DEFAULT_MODEL
-     * @param maxTokens 最大完成token数，默认为MAX_TOKENS
-     * @return API响应结果
-     */
-    suspend fun sendTextMessage(
+    suspend fun sendTextMessageWithContext(
+        conversationId: Int,
         message: String,
-        model: String = DEFAULT_MODEL,
-        maxTokens: Int = MAX_TOKENS
+        userToken: String, // 显式接收 Token
+        apiService: DoubaoApiService
     ): Result<DoubaoChatResponse> {
-        val apiKey = DoubaoApiClient.getApiKey()
-            ?: return Result.failure(Exception("API Key未设置"))
+        val apiKey = DoubaoApiClient.getApiKey() ?: return Result.failure(Exception("API Key未设置"))
 
-        val request = DoubaoChatRequest(
-            model = model,
-            max_completion_tokens = maxTokens,
-            messages = listOf(
-                DoubaoMessage(
-                    role = "user",
-                    content = listOf(
-                        DoubaoContent(
-                            type = "text",
-                            text = message
+        val historyMessages = mutableListOf<DoubaoMessage>()
+        try {
+            // 使用传入的 userToken 进行查询
+            val historyRes = apiService.getChatHistory(
+                token = userToken,
+                conversationId = conversationId
+            )
+
+            if (historyRes.isSuccessful) {
+                val rawList = historyRes.body()?.data?.list ?: emptyList()
+                rawList.takeLast(6).forEach { historyItem ->
+                    historyMessages.add(
+                        DoubaoMessage(
+                            role = historyItem.role,
+                            content = listOf(DoubaoContent(type = "text", text = historyItem.content))
                         )
                     )
-                )
-            )
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("ChatDebug", "获取历史异常: ${e.message}")
+        }
+
+        val currentMessage = DoubaoMessage(
+            role = "user",
+            content = listOf(DoubaoContent(type = "text", text = message))
+        )
+
+        val request = DoubaoChatRequest(
+            model = "doubao-seed-1-6-lite-251015",
+            max_completion_tokens = 65535,
+            messages = historyMessages + currentMessage
         )
 
         return try {
-            val response = DoubaoApiClient.instance.chatCompletion(
-                authorization = "Bearer $apiKey",
-                request = request
-            )
-
-            if (response.isSuccessful) {
-                response.body()?.let {
-                    Result.success(it)
-                } ?: Result.failure(Exception("响应体为空"))
+            val response = apiService.chatCompletion("Bearer $apiKey", request = request)
+            if (response.isSuccessful && response.body() != null) {
+                Result.success(response.body()!!)
             } else {
-                Result.failure(Exception("API请求失败: ${response.code()} - ${response.message()}"))
+                Result.failure(Exception("API错误: ${response.code()}"))
             }
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
-    /**
-     * 发送图文消息到豆包API
-     * @param text 文字内容
-     * @param imageUrl 图片URL
-     * @param model 模型名称，默认为DEFAULT_MODEL
-     * @param maxTokens 最大完成token数，默认为MAX_TOKENS
-     * @return API响应结果
-     */
-    suspend fun sendImageTextMessage(
-        text: String,
-        imageUrl: String,
-        model: String = DEFAULT_MODEL,
-        maxTokens: Int = MAX_TOKENS
-    ): Result<DoubaoChatResponse> {
-        val apiKey = DoubaoApiClient.getApiKey()
-            ?: return Result.failure(Exception("API Key未设置"))
+    // 在 DoubaoApiHelper 类中添加
+    suspend fun generateFirstHeadline(userMsg: String, aiMsg: String): String {
+        val apiKey = DoubaoApiClient.getApiKey() ?: return "新对话"
 
+        val prompt = "请根据以下第一轮对话，总结一个7字以内的标题，不要标点符号和空行：\n用户：$userMsg\nAI：$aiMsg"
+
+        // 优化 1：直接传 String，并且稍微调大 tokens 防止截断
         val request = DoubaoChatRequest(
-            model = model,
-            max_completion_tokens = maxTokens,
+            model = "doubao-seed-1-6-lite-251015",
+            max_completion_tokens = 65535,
             messages = listOf(
-                DoubaoMessage(
-                    role = "user",
-                    content = listOf(
-                        DoubaoContent(
-                            type = "image_url",
-                            image_url = DoubaoImageUrl(url = imageUrl)
-                        ),
-                        DoubaoContent(
-                            type = "text",
-                            text = text
-                        )
-                    )
-                )
-            ),
-            reasoning_effort = "medium"
+                DoubaoMessage(role = "user", content = prompt)
+            )
         )
 
         return try {
-            val response = DoubaoApiClient.instance.chatCompletion(
-                authorization = "Bearer $apiKey",
-                request = request
-            )
+            val response = DoubaoApiClient.instance.chatCompletion("Bearer $apiKey", request = request)
 
-            if (response.isSuccessful) {
-                response.body()?.let {
-                    Result.success(it)
-                } ?: Result.failure(Exception("响应体为空"))
+            val body = response.body()
+            // 核心日志：打印解析后的完整数据体！
+            Log.d("ChatDebug", "【标题生成】完整 Body: $body")
+
+            if (response.isSuccessful && body != null) {
+                val rawContent = body.choices.firstOrNull()?.message?.content
+                Log.d("ChatDebug", "【标题生成】提取到的 rawContent: $rawContent")
+
+                // 优化 2：安全解析 Any? 类型，防止直接 toString() 变成内存地址或带格式的字符串
+                val extractedStr = when (rawContent) {
+                    is String -> rawContent
+                    is List<*> -> {
+                        val first = rawContent.firstOrNull()
+                        if (first is Map<*, *>) first["text"]?.toString() ?: ""
+                        else ""
+                    }
+                    else -> rawContent?.toString() ?: ""
+                }
+
+                // 清理多余字符
+                val cleanTitle = extractedStr.trim().replace(Regex("[\n\r\"'*\\[\\]]"), "")
+
+                if (cleanTitle.isNotEmpty()) {
+                    cleanTitle.take(7)
+                } else {
+                    Log.w("ChatDebug", "【标题生成】提取后标题为空，使用兜底")
+                    userMsg.take(7)
+                }
             } else {
-                Result.failure(Exception("API请求失败: ${response.code()} - ${response.message()}"))
+                Log.e("ChatDebug", "【标题生成】Body为空或请求失败: ${response.errorBody()?.string()}")
+                userMsg.take(7)
             }
         } catch (e: Exception) {
-            Result.failure(e)
+            Log.e("ChatDebug", "【标题生成】代码异常: ${e.message}")
+            userMsg.take(7)
         }
     }
 }

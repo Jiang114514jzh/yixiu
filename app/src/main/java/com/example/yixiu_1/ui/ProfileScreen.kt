@@ -59,10 +59,27 @@ fun ProfileScreen(
     var avatarPath by remember { mutableStateOf(userPreferences.avatarPath) }
     val userEmail by remember { derivedStateOf { userPreferences.userEmail } }
     var nickname by remember { mutableStateOf(userPreferences.getNicknameOrGenerate()) }
-    var isEditingNickname by remember { mutableStateOf(false) }
-    var editingNicknameText by remember(isEditingNickname) { mutableStateOf(nickname) }
-    val maxNicknameLength = 20
-    var isSubmittingNickname by remember { mutableStateOf(false) }
+
+    // 【新增】：每次进入/返回个人主页时，自动拉取最新的用户信息并同步名字
+    LaunchedEffect(isLoggedIn) {
+        if (isLoggedIn) {
+            try {
+                val response = NetworkClient.instance.getUserInfo()
+                if (response.isSuccessful && response.body()?.code == 200) {
+                    val userInfo = response.body()?.data
+                    if (userInfo != null) {
+                        // 优先使用 username，如果为空则用 realName
+                        val newName = userInfo.username ?: userInfo.realName ?: "未知用户"
+                        nickname = newName
+                        // 同步到本地缓存
+                        userPreferences.nickname = newName
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("ProfileScreen", "同步用户信息失败: ${e.message}")
+            }
+        }
+    }
 
     val imagePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
@@ -105,6 +122,7 @@ fun ProfileScreen(
                     // 4. 【关键修复】上传成功后，重新获取用户信息以拿到最新的头像 URL
                     val userResp = NetworkClient.instance.getUserInfo()
                     val userInfo = userResp.body()?.data
+                    Log.e("Check2","${userInfo}")
                     val serverAvatarUrl = userInfo?.avatar
                     Log.d("AvatarDebug", "6. getUserInfo 返回的原始 avatar 字段: '${userInfo?.avatar}'")
 
@@ -164,101 +182,13 @@ fun ProfileScreen(
                 )
 
                 if (isLoggedIn) {
-                    if (isEditingNickname) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            OutlinedTextField(
-                                value = editingNicknameText,
-                                onValueChange = { if (it.length <= maxNicknameLength) editingNicknameText = it },
-                                label = { Text("新昵称") },
-                                singleLine = true,
-                                modifier = Modifier.fillMaxWidth(0.8f)
-                            )
-                            Row(
-                                modifier = Modifier.fillMaxWidth(0.8f),
-                                horizontalArrangement = Arrangement.End,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                TextButton(
-                                    onClick = { isEditingNickname = false },
-                                    enabled = !isSubmittingNickname // 提交期间禁止点击取消
-                                ) {
-                                    Text("取消")
-                                }
-                                Spacer(modifier = Modifier.width(8.dp))
-                                TextButton(
-                                    onClick = {
-                                        if (editingNicknameText.isBlank()) {
-                                            Toast.makeText(context, "昵称不能为空", Toast.LENGTH_SHORT).show()
-                                            return@TextButton
-                                        }
+                    // 【修改】：删除了原本复杂的编辑逻辑和按钮，只保留纯文本展示
+                    Text(
+                        text = nickname,
+                        style = MaterialTheme.typography.headlineSmall,
+                        modifier = Modifier.align(Alignment.CenterHorizontally)
+                    )
 
-                                        isSubmittingNickname = true
-                                        scope.launch {
-                                            try {
-                                                // 1. 发起修改昵称的请求 (确保之前在 ApiService 加上了 UpdateUserInfoRequest)
-                                                val updateRequest = com.example.yixiu_1.network.UpdateUserInfoRequest(username = editingNicknameText)
-                                                val updateResponse = NetworkClient.instance.updateUserInfo(updateRequest)
-
-                                                if (updateResponse.isSuccessful && updateResponse.body()?.code == 200) {
-                                                    // 2. 修改成功后，立刻重新获取最新的用户信息
-                                                    val userInfoResponse = NetworkClient.instance.getUserInfo()
-
-                                                    if (userInfoResponse.isSuccessful && userInfoResponse.body()?.code == 200) {
-                                                        val userInfo = userInfoResponse.body()?.data
-                                                        if (userInfo != null) {
-                                                            // 3. 更新本地缓存和 UI 状态
-                                                            userPreferences.nickname = userInfo.username
-                                                            nickname = userInfo.username // 立刻刷新页面上的名字
-
-                                                            Toast.makeText(context, "昵称修改成功", Toast.LENGTH_SHORT).show()
-                                                            isEditingNickname = false // 关闭编辑框
-                                                        }
-                                                    } else {
-                                                        Toast.makeText(context, "昵称已修改，但刷新数据失败", Toast.LENGTH_SHORT).show()
-                                                        isEditingNickname = false
-                                                    }
-                                                } else {
-                                                    val msg = updateResponse.body()?.msg ?: "未知错误"
-                                                    Toast.makeText(context, "修改失败: $msg", Toast.LENGTH_SHORT).show()
-                                                }
-                                            } catch (e: Exception) {
-                                                e.printStackTrace()
-                                                Toast.makeText(context, "网络请求异常: ${e.message}", Toast.LENGTH_SHORT).show()
-                                            } finally {
-                                                isSubmittingNickname = false
-                                            }
-                                        }
-                                    },
-                                    enabled = !isSubmittingNickname // 提交期间禁止重复点击
-                                ) {
-                                    if (isSubmittingNickname) {
-                                        // 提交时显示小圆圈动画
-                                        CircularProgressIndicator(
-                                            modifier = Modifier.size(16.dp),
-                                            strokeWidth = 2.dp,
-                                            color = MaterialTheme.colorScheme.primary
-                                        )
-                                    } else {
-                                        Text("保存")
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        Box(modifier = Modifier.fillMaxWidth()) {
-                            Text(
-                                text = nickname,
-                                style = MaterialTheme.typography.headlineSmall,
-                                modifier = Modifier.align(Alignment.Center)
-                            )
-                            TextButton(
-                                onClick = { isEditingNickname = true },
-                                modifier = Modifier.align(Alignment.CenterEnd)
-                            ) {
-                                Text("编辑")
-                            }
-                        }
-                    }
                     userEmail?.let { email ->
                         Text(
                             text = email,
