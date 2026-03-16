@@ -1,5 +1,6 @@
 package com.example.yixiu_1.ui
 
+import SkeletonPostCard
 import android.content.Context
 import android.net.Uri
 import android.util.Log
@@ -262,6 +263,8 @@ fun CommunityHomeContent(
             isLoading = true
         }
         try {
+            kotlinx.coroutines.delay(150)
+
             val response = NetworkClient.instance.getCommunityPosts(pageNum, 10)
             if (response.isSuccessful && response.body()?.code == 200) {
                 val pageData = response.body()?.data
@@ -269,102 +272,120 @@ fun CommunityHomeContent(
                 val total = pageData?.total ?: 0
                 hasMoreData = (pageNum * 10) < total
 
+                // 👇 【核心修复】：把滑动操作放进 scope.launch 中！
+                // 这样它就不会阻塞当前的协程向下走到 finally，从而打破死锁
                 if (posts.isNotEmpty()) {
-                    listState.scrollToItem(0)
+                    scope.launch {
+                        listState.scrollToItem(0)
+                    }
                 }
             }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
+            // 协程不被阻塞，顺利来到这里将 isLoading 设为 false
+            // 骨架屏消失，真正的 PostList 挂载，刚才 scope 里等待的滑动瞬间执行！
             isLoading = false
         }
     }
 
-    // 【修改】：去掉了原本新增的 Column 和 Box，直接渲染 PostList
-    PostList(
-        posts = posts,
-        isLoading = isLoading,
-        emptyText = "暂无帖子",
-        onDeleteSuccess = {
-            pageNum = 1
-            refreshTrigger += 1
-        },
-        onFavoriteToggle = { post ->
-            val newIsFavorite = if (post.isFavorite == 1) 0 else 1
-            val newFavCount = if (newIsFavorite == 1) post.favoriteNum + 1 else post.favoriteNum - 1
-            posts = posts.map {
-                if (it.postId == post.postId) it.copy(isFavorite = newIsFavorite, favoriteNum = newFavCount) else it
+    // 👇 【核心修改】：通过 isLoading 判断，渲染骨架屏或真实的帖子列表
+    if (isLoading) {
+        // 正在加载：渲染满屏的骨架卡片
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(top = 8.dp)
+        ) {
+            items(5) {
+                SkeletonPostCard()
             }
-            scope.launch {
-                val success = togglePostFavorite(post, userPreferences)
-                if (!success) {
-                    posts = posts.map {
-                        if (it.postId == post.postId) it.copy(isFavorite = post.isFavorite, favoriteNum = post.favoriteNum) else it
-                    }
-                    Toast.makeText(context, "操作失败", Toast.LENGTH_SHORT).show()
+        }
+    } else {
+        // 加载完毕：直接渲染真实的 PostList
+        PostList(
+            posts = posts,
+            isLoading = isLoading,
+            emptyText = "暂无帖子",
+            onDeleteSuccess = {
+                pageNum = 1
+                refreshTrigger += 1
+            },
+            onFavoriteToggle = { post ->
+                val newIsFavorite = if (post.isFavorite == 1) 0 else 1
+                val newFavCount = if (newIsFavorite == 1) post.favoriteNum + 1 else post.favoriteNum - 1
+                posts = posts.map {
+                    if (it.postId == post.postId) it.copy(isFavorite = newIsFavorite, favoriteNum = newFavCount) else it
                 }
-            }
-        },
-        onLikeToggle = { post ->
-            val newIsLiked = if (post.isLiked == 1) 0 else 1
-            val newLikeNum = if (newIsLiked == 1) post.likeNum + 1 else post.likeNum - 1
-            posts = posts.map {
-                if (it.postId == post.postId) it.copy(isLiked = newIsLiked, likeNum = newLikeNum) else it
-            }
-            scope.launch {
-                val success = togglePostLike(post, userPreferences)
-                if (!success) {
-                    posts = posts.map {
-                        if (it.postId == post.postId) it.copy(isLiked = post.isLiked, likeNum = post.likeNum) else it
+                scope.launch {
+                    val success = togglePostFavorite(post, userPreferences)
+                    if (!success) {
+                        posts = posts.map {
+                            if (it.postId == post.postId) it.copy(isFavorite = post.isFavorite, favoriteNum = post.favoriteNum) else it
+                        }
+                        Toast.makeText(context, "操作失败", Toast.LENGTH_SHORT).show()
                     }
-                    Toast.makeText(context, "点赞操作失败", Toast.LENGTH_SHORT).show()
                 }
-            }
-        },
-        onUserClick = onUserClick,
-        onItemClick = onPostClick,
-
-        // 👇【关键新增】：将翻页栏作为组件向下传递，同时增加了底部 padding 防止被悬浮按钮遮挡 👇
-        listFooter = {
-            // 只有当有数据且不在加载时，才显示翻页按钮
-            if (posts.isNotEmpty() && !isLoading) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 16.dp)
-                        .padding(bottom = 5.dp), // 留出 80dp 的底部空白，彻底避开新建帖子悬浮按钮
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Button(
-                        onClick = { if (pageNum > 1) pageNum-- },
-                        enabled = pageNum > 1,
-                        modifier = Modifier.weight(1f)
+            },
+            onLikeToggle = { post ->
+                val newIsLiked = if (post.isLiked == 1) 0 else 1
+                val newLikeNum = if (newIsLiked == 1) post.likeNum + 1 else post.likeNum - 1
+                posts = posts.map {
+                    if (it.postId == post.postId) it.copy(isLiked = newIsLiked, likeNum = newLikeNum) else it
+                }
+                scope.launch {
+                    val success = togglePostLike(post, userPreferences)
+                    if (!success) {
+                        posts = posts.map {
+                            if (it.postId == post.postId) it.copy(isLiked = post.isLiked, likeNum = post.likeNum) else it
+                        }
+                        Toast.makeText(context, "点赞操作失败", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            },
+            onUserClick = onUserClick,
+            onItemClick = onPostClick,
+            listFooter = {
+                if (posts.isNotEmpty() && !isLoading) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 16.dp)
+                            .padding(bottom = 5.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = null)
-                        Spacer(Modifier.width(4.dp))
-                        Text("上一页")
-                    }
-                    Text(
-                        text = "第 $pageNum 页",
-                        modifier = Modifier.padding(horizontal = 16.dp),
-                        style = MaterialTheme.typography.bodyLarge,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Button(
-                        onClick = { pageNum++ },
-                        enabled = hasMoreData,
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("下一页")
-                        Spacer(Modifier.width(4.dp))
-                        Icon(Icons.Default.ArrowForward, contentDescription = null)
+                        Button(
+                            onClick = { if (pageNum > 1) pageNum-- },
+                            enabled = pageNum > 1,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Default.ArrowBack, contentDescription = null)
+                            Spacer(Modifier.width(4.dp))
+                            Text("上一页")
+                        }
+                        Text(
+                            text = "第 $pageNum 页",
+                            modifier = Modifier.padding(horizontal = 16.dp),
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Button(
+                            onClick = { pageNum++ },
+                            enabled = hasMoreData,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("下一页")
+                            Spacer(Modifier.width(4.dp))
+                            Icon(Icons.Default.ArrowForward, contentDescription = null)
+                        }
                     }
                 }
-            }
-        },
-                listState = listState
-    )
+            },
+            listState = listState
+        )
+    }
 }
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -1794,14 +1815,13 @@ fun OtherUserProfileScreen(
                         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
                     ) {
                         Column(Modifier.padding(16.dp)) {
-                            InfoRow("年级", vol.grade)
-                            // 将完成率转为百分比展示，例如 0.1429 -> 14%
+                            // 【核心修复】：加上 ?: "未知" 和 ?: "未提供" 防止后端传 null 导致崩溃
+                            InfoRow("年级", vol.grade ?: "未知")
                             InfoRow("完成率", "${(vol.finishRate * 100).toInt()}%")
-                            InfoRow("联系方式", vol.contactNumber)
+                            InfoRow("联系方式", vol.contactNumber ?: "未提供")
                         }
                     }
                 }
-
                 // ================= 4. 底部其他信息 =================
                 Spacer(Modifier.height(16.dp))
                 Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {

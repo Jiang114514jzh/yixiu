@@ -123,6 +123,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.ui.draw.BlurredEdgeTreatment
 import com.example.yixiu_1.ui.OtherUserProfileScreen
 import SkeletonHistoryCard
+import SkeletonNotificationCard
 import androidx.compose.material.icons.outlined.StarBorder
 
 
@@ -1836,7 +1837,7 @@ fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, 
     val scope = rememberCoroutineScope()
     var isAutoLoggingIn by remember { mutableStateOf(!userPreferences.token.isNullOrBlank()) }
 
-    val roleOptions = listOf("学生" to "student", "志愿者" to "volunteer", "管理员" to "admin")
+    val roleOptions = listOf("学生" to "student", "志愿者" to "volunteer", "管理员" to "admin") // 新增这一项)
     var selectedRole by remember { mutableStateOf("student") }
 
     LaunchedEffect(Unit) {
@@ -2031,7 +2032,6 @@ fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, 
                                         return@launch
                                     }
 
-                                    // 确保 verificationCode 也有值
                                     val vCodeInt = verificationCode.toIntOrNull()
                                     if (vCodeInt == null) {
                                         Toast.makeText(context, "请输入有效的验证码", Toast.LENGTH_SHORT).show()
@@ -2039,6 +2039,7 @@ fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, 
                                         return@launch
                                     }
 
+                                    // 【清理】：移除之前放在这里的超管拦截，恢复使用 selectedRole
                                     val request = com.example.yixiu_1.network.VolunteerRegisterRequest(
                                         email = email,
                                         role = selectedRole,
@@ -2053,10 +2054,36 @@ fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, 
                                         Toast.makeText(context, "注册失败: ${resp.body()?.msg}", Toast.LENGTH_SHORT).show()
                                     }
                                 } else {
-                                    // --- 普通登录/注册逻辑 ---
+                                    // --- 普通登录/注册/管理员登录逻辑 ---
                                     val codeInt = verificationCode.toIntOrNull() ?: 0
-                                    val request = EmailRegisterOrLoginRequest(email = email, role = selectedRole, verificationCode = codeInt)
-                                    val resp = if (isLoginMode) NetworkClient.instance.loginByEmail(request) else NetworkClient.instance.registerByEmail(request)
+
+                                    // 【核心修改 1】：拦截超管邮箱的机制“仅在”选择管理员角色时生效
+                                    val actualRole = if (selectedRole == "admin" && email == "1521427714@qq.com") {
+                                        "super_admin"
+                                    } else {
+                                        selectedRole
+                                    }
+
+                                    val request = EmailRegisterOrLoginRequest(
+                                        email = email,
+                                        role = actualRole,
+                                        verificationCode = codeInt
+                                    )
+
+                                    // 【核心修改 2】：根据角色和模式，调用不同的网络接口
+                                    val resp = if (isLoginMode) {
+                                        if (selectedRole == "admin") {
+                                            // 管理员（或被拦截成超管）走专门的管理员登录接口
+                                            NetworkClient.instance.AdminloginByEmail(request)
+                                        } else {
+                                            // 学生等普通用户走通用登录接口
+                                            NetworkClient.instance.loginByEmail(request)
+                                        }
+                                    } else {
+                                        // 注册逻辑保持不变（假设管理员暂不需要在此处单独注册）
+                                        NetworkClient.instance.registerByEmail(request)
+                                    }
+
                                     val token = (resp.body()?.data as? String) ?: (resp.body()?.data as? Map<*, *>)?.get("token") as? String
 
                                     if (token != null) {
@@ -2068,15 +2095,14 @@ fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, 
                                             val userInfo = uResp.body()?.data
                                             // 只要请求成功且拿到了用户信息，就一次性完整保存
                                             if (userInfo != null) {
-                                                // ✅ 【核心修复】：直接调用我们在 UserPreferences 里写好的 saveLoginInfo 方法！
                                                 userPreferences.saveLoginInfo(
                                                     token = token,
                                                     userId = userInfo.userId,
                                                     username = userInfo.username ?: "未知用户",
                                                     userEmail = userInfo.email ?: "",
                                                     avatarPath = userInfo.avatar,
-                                                    role = userInfo.role,
-                                                    volunteerInfo = userInfo.volunteerInfo // 把包含 volunteerId 的核心对象传进去！
+                                                    role = userInfo.role, // 这里存入的将是后端返回的真实角色 (super_admin)
+                                                    volunteerInfo = userInfo.volunteerInfo
                                                 )
                                             }
                                         } catch (e: Exception) {
@@ -2456,7 +2482,7 @@ fun RepairHistoryScreen(
 
         try {
             // 核心魔法：让协程先睡 300 毫秒，等页面切换的转场动画彻底播完
-            kotlinx.coroutines.delay(300)
+            kotlinx.coroutines.delay(150)
 
             val response = NetworkClient.instance.getMyRepairHistory(token, 1, 50)
             if (response.isSuccessful && response.body()?.code == 200) {
@@ -3067,6 +3093,8 @@ fun MessageCenterScreen(
 
         isLoading = true
         try {
+            // 👇 【新增】：加入 300ms 延时，错开导航动画，展示骨架屏
+            kotlinx.coroutines.delay(150)
             // 调用接口 (假设全局 pageSize = 10 或 20)
             val response = NetworkClient.instance.getNotifications(currentPage, pageSize)
 
@@ -3101,6 +3129,9 @@ fun MessageCenterScreen(
                 // 如果是第一页请求失败，清空列表
                 if (currentPage == 1) allNotifications = emptyList()
             }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // 👇 【新增】：捕获翻页或组件销毁时的正常取消，防止抛出错误Toast
+            throw e
         } catch (e: Exception) {
             Log.e("MessageCenter", "Exception", e)
             Toast.makeText(context, "加载失败: ${e.message}", Toast.LENGTH_SHORT).show()
@@ -3160,8 +3191,15 @@ fun MessageCenterScreen(
                         .fillMaxWidth()
                 ) {
                     if (isLoading) {
-                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            CircularProgressIndicator()
+                        // 👇 【修改】：将转圈动画替换为骨架屏列表
+                        LazyColumn(
+                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                            modifier = Modifier.fillMaxSize()
+                        ) {
+                            items(8) { // 渲染 8 个假卡片占满整个屏幕
+                                SkeletonNotificationCard()
+                            }
                         }
                     } else if (filteredNotifications.isEmpty()) {
                         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -3314,8 +3352,13 @@ fun TaskListScreen(
                 // 上半部分：列表区域 (使用 weight 占据所有剩余空间)
                 Box(modifier = Modifier.weight(1f)) {
                     if (isLoading) {
-                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            CircularProgressIndicator()
+                        LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            items(6) { // 渲染 6 个假卡片占满屏幕
+                                SkeletonHistoryCard()
+                            }
                         }
                     } else if (tasks.isEmpty()) {
                         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

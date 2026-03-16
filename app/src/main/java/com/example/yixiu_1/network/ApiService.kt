@@ -169,6 +169,9 @@ interface ApiService {
     @POST("/api/v1/users/loginByEmail")
     suspend fun loginByEmail(@Body body: EmailRegisterOrLoginRequest): Response<ApiResponse<Any>>
 
+    @POST("/api/v1/admin/loginByEmail")
+    suspend fun AdminloginByEmail(@Body body: EmailRegisterOrLoginRequest): Response<ApiResponse<Any>>
+
     // --- 报修任务相关接口 ---
     @POST("/api/v1/task/add")
     suspend fun submitRepairTask(@Body task: RepairTaskRequest): Response<ApiResponse<Any>>
@@ -319,11 +322,11 @@ interface ApiService {
         @Query("pageSize") pageSize: Int
     ): Response<ApiResponse<VolunteerPageResponse>> // 引用当前文件的类
 
-    @POST("/api/v1/admin/volunteerInfo")
+    @PUT("/api/v1/admin/volunteerInfo")
     suspend fun updateVolunteerInfo(
         @Header("Authorization") token: String,
-        @Body info: VolunteerDetail // 引用当前文件的类
-    ): Response<ApiResponse<Unit>>
+        @Body info: UpdateVolunteerRequest
+    ): Response<ApiResponse<Any>>
 
     @PUT("/api/v1/task/updateStatus")
     suspend fun updateTaskStatus(
@@ -666,6 +669,7 @@ data class VolunteerUserItem(
     val userId: Int,
     val username: String,
     val realName: String?,
+    val email: String?,
     val avatar: String?,
     val role: String,
     val volunteerInfo: VolunteerDetail?
@@ -789,3 +793,12 @@ data class AddEvaluationRequest(
     val score: Int
 )
 
+data class UpdateVolunteerRequest(
+    val userId: Int,
+    val realName: String?,
+    val studentNumber: String?,
+    val majorClass: String?,
+    val grade: String?,
+    val status: Int,
+    val role: String?
+)

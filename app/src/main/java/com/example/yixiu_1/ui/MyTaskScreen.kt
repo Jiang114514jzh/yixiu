@@ -39,6 +39,7 @@ import android.util.Log
 import com.example.yixiu_1.TaskDetailScreen
 
 import com.example.yixiu_1.network.*
+import SkeletonHistoryCard
 
 
 // MainActivity.kt
@@ -71,6 +72,8 @@ fun MyTasksScreen(
         scope.launch {
             isLoading = true
             try {
+                // 👇 [新增]：让协程先睡 300 毫秒，等页面转场动画播完，同时展示骨架屏
+                kotlinx.coroutines.delay(150)
                 val authHeader = if (token.startsWith("Bearer ")) token else "Bearer $token"
                 val response = NetworkClient.instance.getMyTaskByVolunteerId(
                     authHeader,
@@ -115,9 +118,20 @@ fun MyTasksScreen(
         } else {
             Column(modifier = Modifier.fillMaxSize()) {
                 // 上部：任务列表 (占据剩余空间)
+                // 上部：任务列表 (占据剩余空间)
                 Box(modifier = Modifier.weight(1f)) {
                     if (isLoading) {
-                        CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+                        // 👇 [修改]：将转圈动画替换为骨架屏列表
+                        LazyColumn(
+                            contentPadding = PaddingValues(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                            modifier = Modifier.fillMaxSize()
+                        ) {
+                            items(6) {
+                                // 复用你之前在 TaskListScreen 中写好的 SkeletonTaskCard
+                                SkeletonHistoryCard()
+                            }
+                        }
                     } else if (tasks.isEmpty()) {
                         Text("暂无参与的任务", modifier = Modifier.align(Alignment.Center), color = Color.Gray)
                     } else {
