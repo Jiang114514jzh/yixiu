@@ -87,4 +87,41 @@ class NotificationHelper(private val context: Context) {
             NotificationManagerCompat.from(context).areNotificationsEnabled()
         }
     }
+
+    // 提醒匹配成功的志愿者进行维修
+    fun showExpertRecommendationNotification(category: String) {
+        if (!hasNotificationPermission()) {
+            return
+        }
+
+        // 点击通知后跳转到任务大厅 (假设标识为 task_square)
+        val intent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            putExtra("target_screen", "task_square")
+        }
+
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            0, // 这里可以使用不同的 RequestCode
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("✨ 专属任务推荐") // 使用特殊的标题吸引注意
+            .setContentText("系统发现了一个您擅长的【$category】新报修单，快去看看吧！")
+            .setPriority(NotificationCompat.PRIORITY_HIGH) // 推荐任务优先级设为高
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+
+        try {
+            with(NotificationManagerCompat.from(context)) {
+                // 使用系统时间作为ID，确保推荐通知不会覆盖其他普通通知
+                notify(System.currentTimeMillis().toInt(), builder.build())
+            }
+        } catch (e: SecurityException) {
+            android.util.Log.e("NotificationHelper", "通知权限被拒绝", e)
+        }
+    }
 }

@@ -41,6 +41,16 @@ import com.example.yixiu_1.TaskDetailScreen
 import com.example.yixiu_1.network.*
 import SkeletonHistoryCard
 
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.outlined.Star
+import androidx.compose.material3.Icon
+import androidx.compose.ui.unit.dp
+
 
 // MainActivity.kt
 @Composable
@@ -193,6 +203,29 @@ fun MyTasksScreen(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+fun StarRatingBar(
+    rating: Int,
+    onRatingChanged: (Int) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(modifier = modifier) {
+        for (i in 1..5) {
+            val isSelected = i <= rating
+            Icon(
+                imageVector = if (isSelected) Icons.Filled.Star else Icons.Outlined.Star,
+                contentDescription = "Star $i",
+                // 选中的星星显示橘黄色，未选中的显示灰色
+                tint = if (isSelected) Color(0xFFFFC107) else Color.LightGray,
+                modifier = Modifier
+                    .size(40.dp) // 星星稍微大一点方便点击
+                    .clickable { onRatingChanged(i) }
+                    .padding(4.dp)
+            )
         }
     }
 }

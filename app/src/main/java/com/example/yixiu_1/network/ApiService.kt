@@ -20,6 +20,11 @@ import retrofit2.http.Query
 import java.util.concurrent.TimeUnit
 import retrofit2.http.Field
 import retrofit2.http.FormUrlEncoded
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
 // 1. 【恢复】使用你原先定义的 NotifyItem (Int 和 String)
 data class NotifyItem(
@@ -91,7 +96,11 @@ data class RepairTaskItem(
     val appointmentTime: String?,
     val remarks: String?,
     val status: Int,
+    val skillId: Int,
     val imgUrl: List<String>?,
+    // 【新增】以下两个字段用于智能匹配功能
+    val category: String? = null,        // 任务分类 (如: "软件系统", "硬件清灰")
+    val isExpertMatch: Boolean? = false, // 是否为该志愿者的推荐任务
     // 【核心新增字段】：接收后端的分配列表
     val repairAssignment: List<RepairAssignment>? = null,
     val repairLog: List<RepairLog>? = null,
@@ -315,6 +324,13 @@ interface ApiService {
         @Body request: SendDeleteNotifyRequest
     ): Response<ApiResponse<Any>>
 
+    //用户给用户发送通知
+    @POST("/api/v1/notify/userToUser")
+    suspend fun sendUserNotification(
+        @Header("Authorization") token: String,
+        @Body request: SendUserToUserNotifyRequest
+    ): Response<ApiResponse<Any>>
+
     @GET("/api/v1/volunteer/infoListExcludeUserId")
     suspend fun getVolunteerList(
         @Header("Authorization") token: String,
@@ -389,12 +405,19 @@ interface ApiService {
         @Body request: UpdateKnowledgeRequest
     ): Response<ApiResponse<Any>>
 
+    //加入义修小队申请
     @POST("/api/v1/task/applyToJoin")
     suspend fun addJoinRequest(
         @Header("Authorization") token: String,
         @Body request: AddJoinRequest
     )
 
+    //加入义修小队提醒
+    @POST("/api/v1/notify/applyToCooperate")
+    suspend fun joinNotification(
+        @Header("Authorization") token: String,
+        @Body request: JoinNotificationRequest
+    )
     @PUT("/api/v1/task/approveTaskApply")
     suspend fun approveJoinRequest(
         @Header("Authorization") token: String,
@@ -462,12 +485,40 @@ interface ApiService {
         @Body request: AddEvaluationRequest
     ): Response<ApiResponse<Any>> // 返回 Any 防止 Gson 解析 null 报错
 
+    // 1. 获取特定报修单详情 (图2接口)
+    @GET("/api/v1/task/getByRid")
+    suspend fun getTaskById(
+        @Header("Authorization") token: String,
+        @Query("requestId") requestId: Int
+    ): Response<ApiResponse<RepairTaskItem>> // 假设你后端的 data 里包裹的是这一个任务对象
+
+    // 2. 根据 skillId 获取志愿者技能列表 (图1接口)
+    @GET("/api/v1/volunteer/skillListBySkillId")
+    suspend fun getSkillListBySkillId(
+        @Header("Authorization") token: String,
+        @Query("skillId") skillId: Int
+    ): Response<ApiResponse<List<VolunteerSkillItem>>>
+
+    // 上传维修结单图片
+    @Multipart
+    @POST("/api/v1/task/uploadRequestImg")
+    suspend fun uploadTaskImage(
+        @Header("Authorization") token: String,
+        @Part("requestId") requestId: RequestBody,
+        @Part img: List<MultipartBody.Part> // 支持多图上传，如果后端只允许单图，可改为 @Part img: MultipartBody.Part
+    ): Response<ApiResponse<Any>>
 }
 
 //============ Retrofit 客户端实例 ============
 object NetworkClient {
     private const val BASE_URL = "http://8.148.253.180:8080"
     private var token: String? = null
+    // 1. 创建一个信任所有证书的 TrustManager
+    private val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
+        override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
+        override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {}
+        override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+    })
 
     // 公开的方法，用于在登录后更新 token
     fun setToken(newToken: String?) {
@@ -490,12 +541,23 @@ object NetworkClient {
         level = HttpLoggingInterceptor.Level.BODY
     }
 
-    private val okHttpClient: OkHttpClient = OkHttpClient.Builder()
-        .addInterceptor(loggingInterceptor)
-        .addInterceptor(authInterceptor) // 确保认证拦截器被添加
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .build()
+    // 在 NetworkClient.kt 中找到这部分，确保它是 val 而不是 private val
+    val okHttpClient: OkHttpClient = try {
+        val sslContext = SSLContext.getInstance("SSL")
+        sslContext.init(null, trustAllCerts, SecureRandom())
+        val sslSocketFactory = sslContext.socketFactory
+
+        OkHttpClient.Builder()
+            .sslSocketFactory(sslSocketFactory, trustAllCerts[0] as X509TrustManager)
+            .hostnameVerifier { _, _ -> true } // 信任所有域名
+            .addInterceptor(loggingInterceptor)
+            .addInterceptor(authInterceptor)
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .build()
+    } catch (e: Exception) {
+        throw RuntimeException(e)
+    }
 
     // 懒加载的 Retrofit 实例
     private var _instance: ApiService = createInstance()
@@ -515,6 +577,13 @@ object NetworkClient {
 data class PollResponse(
     val type: String,   // "BROADCAST", "SYSTEM", "USER", "NONE"
     val unread: Int     // 未读数量
+)
+
+data class SendUserToUserNotifyRequest(
+    val senderId: Int,
+    val receiverId: Int,
+    val title: String,
+    val content: String
 )
 
 data class CommunityTag(
@@ -801,4 +870,24 @@ data class UpdateVolunteerRequest(
     val grade: String?,
     val status: Int,
     val role: String?
+)
+
+data class PushToExpertsRequest(
+    val requestId: Int,
+    val volunteerIds: List<Int> // 专家的 userId 或 volunteerId 列表
+)
+
+data class VolunteerSkillItem(
+    val skillRelId: Int,
+    val userId: Int,
+    val volunteerId: Int,
+    val skillId: Int,
+    val taskCount: Int,
+    val averageScore: Double,
+    val bayesianScore: Double,
+    val isExpert: Int // 1代表是专家，0代表不是
+)
+
+data class JoinNotificationRequest(
+    val taskId: Int
 )

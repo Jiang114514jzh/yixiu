@@ -69,15 +69,21 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.core.content.ContextCompat
 import coil.request.ImageRequest
+import coil.ImageLoader
 import com.example.yixiu_1.data.UserPreferences
 import com.example.yixiu_1.network.EmailRegisterOrLoginRequest
 import com.example.yixiu_1.network.RepairHistoryItem
 import com.example.yixiu_1.network.RepairTaskRequest
 import com.example.yixiu_1.ui.KnowledgeScreen
+import com.example.yixiu_1.utils.KnowledgeBaseManager
 
 
 import android.content.Context
 import androidx.compose.foundation.BorderStroke
+
+
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.outlined.Star
 
 // ==================== 必须添加的引用 ====================
 import com.example.yixiu_1.network.NetworkClient
@@ -125,6 +131,19 @@ import com.example.yixiu_1.ui.OtherUserProfileScreen
 import SkeletonHistoryCard
 import SkeletonNotificationCard
 import androidx.compose.material.icons.outlined.StarBorder
+import silentMatchAndNotifyExperts
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.MultipartBody
+import okhttp3.RequestBody.Companion.asRequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.File
+import java.io.FileOutputStream
+import java.util.UUID
 
 
 val pageSize = AppConstants.DEFAULT_PAGE_SIZE
@@ -206,7 +225,6 @@ fun AvatarImage(
     modifier: Modifier = Modifier,
     defaultTint: Color = Color.Gray
 ) {
-    // 【新增】获取 Context 和 UserPreferences 以便读取 Token
     val context = LocalContext.current
     val userPreferences = remember { UserPreferences(context) }
     val token = userPreferences.token
@@ -222,30 +240,17 @@ fun AvatarImage(
             )
             // 上层：网络图片
             AsyncImage(
-                // 【修改】使用 ImageRequest 构建器，添加 Authorization Header 和监听器
                 model = ImageRequest.Builder(context)
                     .data(path)
-                    .crossfade(true) // 淡入效果
+                    .crossfade(true)
                     .apply {
-                        // 【关键修改】如果存在 Token，将其添加到请求头 Authorization 中
-                        // 这样服务器才能通过鉴权返回图片
                         if (!token.isNullOrBlank()) {
                             addHeader("Authorization", token)
                         }
                     }
-                    .listener(
-                        onStart = { Log.d("AvatarImage", "开始加载头像: $path") },
-                        onSuccess = { _, _ -> Log.d("AvatarImage", "头像加载成功") },
-                        onError = { _, result ->
-                            Log.e("AvatarImage", "头像加载失败: $path")
-                            Log.e("AvatarImage", "错误原因: ${result.throwable.localizedMessage}", result.throwable)
-                        }
-                    )
                     .build(),
                 contentDescription = "Avatar",
-                modifier = Modifier
-                    .matchParentSize()
-                    .clip(CircleShape),
+                modifier = Modifier.matchParentSize().clip(CircleShape),
                 contentScale = ContentScale.Crop
             )
         }
@@ -564,11 +569,16 @@ private fun AppContentInternal(
 
     LaunchedEffect(Unit) {
         try {
-            // 注意：这里需要根据你的 ApiService 实际路径来调用
             val response = NetworkClient.instance.getKnowledgeList("${userPreferences.token}")
             if (response.isSuccessful) {
-                localKnowledgeList = response.body()?.data ?: emptyList()
-                Log.d("ChatDebug", "知识库获取成功: ${localKnowledgeList.size} 条")
+                val fetchedList = response.body()?.data ?: emptyList()
+                localKnowledgeList = fetchedList
+
+                // 【最关键的一行！】你有没有漏掉这行代码？
+                // 如果没有这行，KnowledgeBaseManager 永远是空的！
+                KnowledgeBaseManager.updateKnowledgeBase(fetchedList)
+
+                Log.e("ChatDebug", "加载了 ${fetchedList.size} 条知识库进缓存！")
             } else {
                 Log.e("ChatDebug", "接口报错: ${response.code()}")
             }
@@ -582,14 +592,19 @@ private fun AppContentInternal(
         val trimmedInput = inputText.trim()
         if (trimmedInput.isEmpty()) return
 
+        // 【测试代码】一点击发送，就用 Toast 把当前知识库的数量弹出来！
+        val currentKbSize = KnowledgeBaseManager.getCacheSize()
+        Toast.makeText(context, "当前知识库数量: $currentKbSize", Toast.LENGTH_SHORT).show()
+
         val userToken = userPreferences.token ?: ""
         Log.d("ChatDebug", "--- Token 检查 ---")
         Log.d("ChatDebug", "原始 Token 长度: ${userToken.length}")
-        Log.d("ChatDebug", "原始 Token 内容: |$userToken|") // 用竖线包围看是否有空格
+        Log.d("ChatDebug", "原始 Token 内容: |$userToken|")
+
         val apiService = DoubaoApiClient.instance
         val doubaoHelper = DoubaoApiHelper()
 
-        // 1. UI 立即显示用户消息
+        // 1. UI 立即显示用户原始消息
         chatMessages = chatMessages + ChatMessage(content = trimmedInput, role = Role.USER)
         inputText = ""
         isApiLoading = true
@@ -600,70 +615,62 @@ private fun AppContentInternal(
                 var finalAiReply = ""
                 var isFromLocalKB = false
 
-                // --- 步骤 1: 本地匹配 ---
-                if (localKnowledgeList.isNotEmpty()) {
-                    val queryTokens = ChineseSegmenter.tokenize(trimmedInput)
-                    val queryVector = TfIdfMatcher.getTermFrequency(queryTokens)
-                    var maxScore = 0.0
-                    var bestMatch: KnowledgeItem? = null
+                // --- 步骤 1: 极速本地检索 ---
+                val localAnswer = KnowledgeBaseManager.searchBestAnswer(trimmedInput)
 
-                    localKnowledgeList.forEach { item ->
-                        val itemTokens = ChineseSegmenter.tokenize(item.problem)
-                        val itemVector = TfIdfMatcher.getTermFrequency(itemTokens)
-                        val score = TfIdfMatcher.calculateCosineSimilarity(queryVector, itemVector)
-                        if (score > maxScore) {
-                            maxScore = score
-                            bestMatch = item
-                        }
-                    }
+                // --- 步骤 2: 构建动态 Prompt (RAG 核心逻辑) ---
+                val aiPrompt = if (localAnswer != null) {
+                    isFromLocalKB = true
+                    Log.d("ChatDebug", "命中本地库，正在将知识库内容组装为上下文发给 AI...")
 
-                    if (maxScore > 0.4 && bestMatch != null) {
-                        finalAiReply = bestMatch!!.solution
-                        isFromLocalKB = true
-                        Log.d("ChatDebug", "命中本地库: ${bestMatch!!.problem}")
-                    }
+                    // 巧妙拼接提示词：让 AI 扮演客服，并参考知识库进行回答
+                    """
+                用户的问题是：“$trimmedInput”
+                
+                我在内部知识库中检索到了以下高度相关的参考信息：
+                $localAnswer
+                
+                请你作为义修小队的智能助手，基于以上参考信息，以自然、专业、友好的语气回答用户的问题。如果参考信息不足以完全解答，你可以结合你的常识进行适当补充，但切勿瞎编乱造。
+                """.trimIndent()
+                } else {
+                    Log.d("ChatDebug", "未命中本地库，纯 AI 自由回答")
+                    trimmedInput // 没命中就直接把用户的原话发给 AI
                 }
 
-                // --- 步骤 2: 请求 AI (本地未命中时) ---
-                if (!isFromLocalKB) {
-                    val result = withContext(Dispatchers.IO) {
-                        doubaoHelper.sendTextMessageWithContext(conversationId, trimmedInput, userToken, apiService)
-                    }
-                    finalAiReply = if (result.isSuccess) {
-                        result.getOrNull()?.choices?.firstOrNull()?.message?.content?.toString() ?: ""
-                    } else {
-                        "网络异常，请稍后再试"
-                    }
+                // --- 步骤 3: 统一请求 AI ---
+                // 注意：这里传给 AI 的是“加了料”的 aiPrompt
+                val result = withContext(Dispatchers.IO) {
+                    doubaoHelper.sendTextMessageWithContext(conversationId, aiPrompt, userToken, apiService)
+                }
+
+                finalAiReply = if (result.isSuccess) {
+                    result.getOrNull()?.choices?.firstOrNull()?.message?.content?.toString() ?: ""
+                } else {
+                    "网络异常，请稍后再试"
                 }
 
                 if (finalAiReply.isEmpty()) finalAiReply = "暂无回复"
 
-                // --- 步骤 3: 更新 UI ---
+                // --- 步骤 4: 更新 UI ---
                 chatMessages = chatMessages + ChatMessage(content = finalAiReply, role = Role.ASSISTANT)
 
-                // --- 步骤 4: 【核心修复】同步保存到后端 ---
-                // 使用 withContext 确保在后台执行，但逻辑上挂起等待完成
-                // 在 sendMessage 的 scope.launch 内部，AI 回复之后：
+                // --- 步骤 5: 同步保存到后端 ---
                 withContext(Dispatchers.IO) {
-                    val authHeader = userToken
+                    val authHeader = "Bearer $userToken"
 
-                    // 如果是新会话，我们需要在后端“激活”这个 Session
                     if (isPendingNewSession) {
                         val safeInput = if (trimmedInput.length > 8) trimmedInput.take(8) + "..." else trimmedInput
-
-                        // 注意：这里调用 addChatSession 应该确保后端能接受你预设的 conversationId
-                        // 或者，如果 addChatSession 会返回一个新的 ID，我们要以返回的为准
                         val sessionRes = apiService.addChatSession(authHeader, safeInput)
 
                         if (sessionRes.isSuccessful && sessionRes.body()?.data != null) {
-                            // 重要：同步后端生成的真实 ID
                             conversationId = sessionRes.body()!!.data!!.conversationId
                             isPendingNewSession = false
                         }
                     }
 
-                    // 只要有 ID，就保存。这样即便用户重进，第一段对话也会因为 ID 已经存入后端而出现在历史里。
                     if (conversationId > 0) {
+                        // 🌟【精髓所在】：保存到后端的依旧是 trimmedInput（用户的原话）
+                        // 这样即使 AI 是看了长篇知识库回答的，数据库里也不会塞满冗长的 Prompt 模板！
                         apiService.saveChatMessage(authHeader, mapOf(
                             "conversationId" to conversationId,
                             "role" to "user",
@@ -675,7 +682,6 @@ private fun AppContentInternal(
                             "question" to finalAiReply
                         ))
 
-                        // 保存完立即刷新列表，让历史记录显示出来
                         loadHistorySessions(authHeader, apiService)
                     }
                 }
@@ -853,7 +859,7 @@ private fun AppContentInternal(
         }
 
         val backgroundImage = if (isAdmin) {
-            painterResource(id = R.drawable.admin_background)
+            painterResource(id = R.drawable.bg_campus_repair)
         } else {
             painterResource(id = R.drawable.bg_campus_repair)
         }
@@ -898,7 +904,7 @@ private fun AppContentInternal(
                         }
                     )
 
-                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                    //HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
 
                     // 2. 义修服务 (仅学生/普通用户可见)
                     // 逻辑：如果不是志愿者且不是管理员，则显示
@@ -2115,6 +2121,7 @@ fun AuthScreen(modifier: Modifier = Modifier, userPreferences: UserPreferences, 
                                     }
                                 }
                             } catch (e: Exception) {
+                                Log.e("Auth", "Login failed", e)
                                 Toast.makeText(context, "错误: ${e.message}", Toast.LENGTH_SHORT).show()
                             } finally { isLoading = false }
                         }
@@ -2160,6 +2167,7 @@ fun AppointmentQuestionnaireScreen(
     // 基础信息
     var description by remember { mutableStateOf("") }
     var location by remember { mutableStateOf("") }
+    var isSubmitting by remember { mutableStateOf(false) }
 
     // 新增补充信息
     var contactInfo by remember { mutableStateOf("") } // 联系号码
@@ -2175,6 +2183,7 @@ fun AppointmentQuestionnaireScreen(
 
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+
 
     val textFieldColors = TextFieldDefaults.colors(
         focusedContainerColor = Color.White.copy(alpha = 0.9f),
@@ -2361,21 +2370,30 @@ fun AppointmentQuestionnaireScreen(
                 Spacer(modifier = Modifier.height(32.dp))
 
                 Button(
+                    // 🌟 核心修改 1：通过 enabled 属性绑定状态，提交时按钮变灰且不可点击
+                    enabled = !isSubmitting,
                     onClick = {
+                        // 🌟 核心修改 2：双重保险防抖
+                        if (isSubmitting) return@Button
+
+                        val userId = userPreferences.userId
+                        if (userId == -1) {
+                            Toast.makeText(context, "请先登录", Toast.LENGTH_SHORT).show()
+                            return@Button // 注意这里从 return@launch 改为 return@Button
+                        }
+                        if (description.isBlank() || location.isBlank() || contactInfo.isBlank() || deviceType.isBlank() || deviceSystem.isBlank() || appointmentTime.isBlank()) {
+                            Toast.makeText(context, "请填写必填项(描述、地址、联系方式、设备类型和系统、期望预约时间)", Toast.LENGTH_SHORT).show()
+                            return@Button
+                        }
+
                         scope.launch {
-                            val userId = userPreferences.userId
-                            if (userId == -1) {
-                                Toast.makeText(context, "请先登录", Toast.LENGTH_SHORT).show()
-                                return@launch
-                            }
-                            if (description.isBlank() || location.isBlank() || contactInfo.isBlank() || deviceType.isBlank() || deviceSystem.isBlank() || appointmentTime.isBlank()) {
-                                Toast.makeText(context, "请填写必填项(描述、地址、联系方式、设备类型和系统、期望预约时间)", Toast.LENGTH_SHORT).show()
-                                return@launch
-                            }
                             try {
+                                // 🌟 核心修改 3：进入协程后，第一时间锁定按钮
+                                isSubmitting = true
+
                                 // 【修复】根据 Task.kt，userId 是 Int，直接传递
                                 val request = RepairTaskRequest(
-                                    userId = userId, // 直接使用 Int 类型的 userId
+                                    userId = userId,
                                     contactType = contactType,
                                     contactInfo = contactInfo,
                                     deviceType = deviceType,
@@ -2388,24 +2406,18 @@ fun AppointmentQuestionnaireScreen(
                                     remarks = remarks.ifBlank { null }
                                 )
 
-                                // 【关键日志 1】打印将要发送的请求对象
                                 Log.d("SubmitRepair", "Request Body: $request")
-
                                 val response = NetworkClient.instance.submitRepairTask(request)
 
-                                // 【关键日志 2】打印完整的后端响应
                                 val responseBody = response.body()
                                 val errorBody = response.errorBody()?.string()
                                 Log.d("SubmitRepair", "Response Code: ${response.code()}")
-                                Log.d("SubmitRepair", "Response Body: $responseBody")
-                                Log.d("SubmitRepair", "Error Body: $errorBody")
 
                                 if (response.isSuccessful && responseBody?.code == 200) {
                                     // 提交成功后，将记录添加到本地历史
                                     userPreferences.addRepairHistory(
-                                        // 构造一个临时的 RepairHistoryItem 用于本地显示
                                         RepairHistoryItem(
-                                            id = "local_${System.currentTimeMillis()}", // 临时ID
+                                            id = "local_${System.currentTimeMillis()}",
                                             problemDescription = description,
                                             repairLocation = location,
                                             campus = if (campus == 0) "大学城校区" else "白云山校区",
@@ -2419,17 +2431,48 @@ fun AppointmentQuestionnaireScreen(
                                             remarks = remarks
                                         )
                                     )
+
+                                    val rawData = responseBody.data
+                                    val newRequestId = try {
+                                        when (rawData) {
+                                            is Map<*, *> -> rawData["requestId"]?.toString()?.toDoubleOrNull()?.toInt() ?: -1
+                                            is Number -> rawData.toInt()
+                                            is String -> rawData.toDoubleOrNull()?.toInt() ?: -1
+                                            else -> -1
+                                        }
+                                    } catch (e: Exception) {
+                                        -1
+                                    }
+                                    val token = userPreferences.token ?: ""
+
+                                    if (newRequestId != -1 && token.isNotEmpty()) {
+                                        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                                            kotlinx.coroutines.delay(1500)
+                                            silentMatchAndNotifyExperts(
+                                                token = token,
+                                                requestId = newRequestId,
+                                                senderId = userId,
+                                                device = deviceType,
+                                                problem = description,
+                                                location = location,
+                                                time = appointmentTime,
+                                                contact = contactInfo
+                                            )
+                                        }
+                                    }
+
                                     Toast.makeText(context, "提交成功", Toast.LENGTH_SHORT).show()
                                     onSubmissionSuccess()
                                 } else {
-                                    // 【优化】显示更详细的错误信息
                                     val errorMessage = responseBody?.msg ?: errorBody ?: "提交失败，未知错误"
                                     Toast.makeText(context, "提交失败: $errorMessage", Toast.LENGTH_LONG).show()
                                 }
                             } catch (e: Exception) {
-                                // 【关键日志 3】打印网络或程序异常
                                 Log.e("SubmitRepair", "Exception during submission", e)
                                 Toast.makeText(context, "网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
+                            } finally {
+                                // 🌟 核心修改 4：无论成功、失败还是网络异常，最后务必解锁按钮
+                                isSubmitting = false
                             }
                         }
                     },
@@ -2437,7 +2480,18 @@ fun AppointmentQuestionnaireScreen(
                         .fillMaxWidth()
                         .height(50.dp)
                 ) {
-                    Text("提交申请", style = MaterialTheme.typography.titleMedium)
+                    // 🌟 核心修改 5：根据状态改变 UI，给用户更好的反馈
+                    if (isSubmitting) {
+                        CircularProgressIndicator(
+                            color = Color.White, // 如果你的按钮背景是浅色，这里可以换成 MaterialTheme.colorScheme.primary
+                            modifier = Modifier.size(24.dp),
+                            strokeWidth = 2.dp
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("提交中...", style = MaterialTheme.typography.titleMedium)
+                    } else {
+                        Text("提交申请", style = MaterialTheme.typography.titleMedium)
+                    }
                 }
             }
         }
@@ -3033,6 +3087,8 @@ fun MessageCenterScreen(
     val filterOptions = listOf("全部", "系统消息", "广播消息", "用户消息")
     var selectedFilter by remember { mutableStateOf("全部") }
     var showFilterMenu by remember { mutableStateOf(false) }
+    var totalCount by remember { mutableIntStateOf(0) }
+    var totalPages by remember { mutableIntStateOf(1) }
 
     // ================== 逻辑计算 ==================
 
@@ -3098,35 +3154,31 @@ fun MessageCenterScreen(
             // 调用接口 (假设全局 pageSize = 10 或 20)
             val response = NetworkClient.instance.getNotifications(currentPage, pageSize)
 
+
             if (response.isSuccessful && response.body()?.code == 200) {
-                // 【关键修正】先获取 Page 对象，再获取 List
                 val pageData = response.body()?.data
 
-                // 1. 提取列表并进行数据清洗
                 val rawItems = pageData?.list ?: emptyList()
 
-                // 【关键修改】：遍历拿到的数据，一旦发现 isRead 是 null，直接在本地把它变成 1（已读）
                 val newItems = rawItems.map { item ->
-                    if (item.isRead == null) {
-                        item.copy(isRead = 1)
-                    } else {
-                        item
-                    }
+                    if (item.isRead == null) item.copy(isRead = 1) else item
                 }
-                // 这里是翻页覆盖模式（点击下一页，列表刷新为新页数据），如果是无限滚动则需要 list + newItems
+
                 allNotifications = newItems.sortedByDescending { it.createTime }
 
-                // 2. 处理分页信息
-                if (pageData != null) {
-                    // 优先使用 hasNextPage，如果没有则使用 total pages 计算
-                    hasMoreData = pageData.hasNextPage
-                    // 备用逻辑: hasMoreData = currentPage < pageData.pages
-                } else {
-                    hasMoreData = false
-                }
+                // 👇 【核心修复】：使用 ?. 和 ?: 安全提取数据，彻底告别空指针报错
+                val currentTotal = pageData?.total ?: 0
+                val currentPages = pageData?.pages ?: 1
+
+                // 给外部 UI 变量赋值
+                totalCount = currentTotal
+                totalPages = currentPages
+
+                // 计算是否还有下一页 (你的请求里 pageSize 写的是 10)
+                hasMoreData = (currentPage * 10) < currentTotal
+
             } else {
                 Log.e("MessageCenter", "API Error: ${response.code()}")
-                // 如果是第一页请求失败，清空列表
                 if (currentPage == 1) allNotifications = emptyList()
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
@@ -3241,40 +3293,48 @@ fun MessageCenterScreen(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(16.dp),
+                            .padding(horizontal = 16.dp, vertical = 10.dp), // 微调上下间距，更精致
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // 上一页按钮
+                        // 左侧：上一页按钮
                         Button(
-                            onClick = {
-                                if (currentPage > 1) currentPage--
-                            },
+                            onClick = { if (currentPage > 1) currentPage-- },
                             enabled = currentPage > 1,
-                            modifier = Modifier.weight(1f)
+                            // 👇 彻底移除了 weight(1f)，只用 padding 控制按钮大小
+                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
                         ) {
-                            Icon(Icons.Default.ArrowBack, contentDescription = null)
-                            Spacer(Modifier.width(4.dp))
-                            Text("上一页")
+                            Text("上一页", fontSize = 14.sp)
                         }
 
-                        // 页码显示
-                        Text(
-                            text = "第 $currentPage 页",
-                            modifier = Modifier.padding(horizontal = 16.dp),
-                            style = MaterialTheme.typography.bodyLarge,
-                            fontWeight = FontWeight.Bold
-                        )
+                        // 中间：页码与总数展示 (上下结构)
+                        Column(
+                            // 👇 把 weight(1f) 给中间，让它把两侧的按钮完美推开
+                            modifier = Modifier.weight(1f),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Text(
+                                text = "第 $currentPage / $totalPages 页",
+                                style = MaterialTheme.typography.titleMedium, // 稍微加大页码字号突出重点
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF333333)
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "共 $totalCount 条通知",
+                                style = MaterialTheme.typography.labelSmall, // 缩小总数说明的字号，弱化视觉
+                                color = Color.Gray
+                            )
+                        }
 
-                        // 下一页按钮
+                        // 右侧：下一页按钮
                         Button(
                             onClick = { currentPage++ },
-                            enabled = hasMoreData, // 由接口返回的 hasNextPage 控制
-                            modifier = Modifier.weight(1f)
+                            enabled = hasMoreData,
+                            // 👇 同样移除 weight(1f)
+                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
                         ) {
-                            Text("下一页")
-                            Spacer(Modifier.width(4.dp))
-                            Icon(Icons.Default.ArrowForward, contentDescription = null)
+                            Text("下一页", fontSize = 14.sp)
                         }
                     }
                 }
@@ -3594,25 +3654,23 @@ fun TaskDetailScreen(
     var evalScore by remember { mutableIntStateOf(5) } // 默认 5 星
     var isSubmittingEval by remember { mutableStateOf(false) }
 
-
-
     BackHandler { onBack() }
 
     Scaffold(
-        containerColor = Color(0xFFF5F5F5),
+        // 外层背景色稍微加深一点，用来衬托中间的白色大卡片
+        containerColor = Color(0xFFEBEBF0),
+        // 移除了 topBar，让返回按钮可以滚动
         bottomBar = {
-            // 【核心修复】：在最外层加一个 Column 占位！
-            // 这能强制 Scaffold 始终正确计算和分配底部栏的高度，解决按钮渲染不出来的系统 Bug。
             Column(modifier = Modifier.fillMaxWidth()) {
-
                 if (isAdmin && isPending) {
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
-                        shadowElevation = 8.dp,
+                        shadowElevation = 16.dp,
+                        shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
                         color = Color.White
                     ) {
                         Row(
-                            modifier = Modifier.padding(16.dp).navigationBarsPadding(),
+                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp).navigationBarsPadding(),
                             horizontalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
                             OutlinedButton(
@@ -3634,11 +3692,12 @@ fun TaskDetailScreen(
                 if (isVolunteerOrAdmin && isApproved) {
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
-                        shadowElevation = 8.dp,
+                        shadowElevation = 16.dp,
+                        shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
                         color = Color.White
                     ) {
                         Row(
-                            modifier = Modifier.padding(16.dp).navigationBarsPadding(),
+                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp).navigationBarsPadding(),
                             horizontalArrangement = Arrangement.Center
                         ) {
                             Button(
@@ -3661,11 +3720,12 @@ fun TaskDetailScreen(
                     if (!isConfirmedMember) {
                         Surface(
                             modifier = Modifier.fillMaxWidth(),
-                            shadowElevation = 8.dp,
+                            shadowElevation = 16.dp,
+                            shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
                             color = Color.White
                         ) {
                             Row(
-                                modifier = Modifier.padding(16.dp).navigationBarsPadding(),
+                                modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp).navigationBarsPadding(),
                                 horizontalArrangement = Arrangement.Center
                             ) {
                                 Button(
@@ -3698,21 +3758,21 @@ fun TaskDetailScreen(
                     }
                 }
 
-                // 👇 【评价按钮】：彻底独立！只要状态是 3 就一定会渲染 👇
                 if (task.status == 3 && false) {
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
-                        shadowElevation = 8.dp,
+                        shadowElevation = 16.dp,
+                        shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
                         color = Color.White
                     ) {
                         Row(
-                            modifier = Modifier.padding(16.dp).navigationBarsPadding(),
+                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp).navigationBarsPadding(),
                             horizontalArrangement = Arrangement.Center
                         ) {
                             Button(
                                 onClick = { showEvalDialog = true },
                                 modifier = Modifier.fillMaxWidth(),
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF9800)) // 橙色按钮
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF9800))
                             ) {
                                 Icon(Icons.Default.Star, contentDescription = null)
                                 Spacer(Modifier.width(8.dp))
@@ -3724,336 +3784,386 @@ fun TaskDetailScreen(
             }
         },
     ) { innerPadding ->
+        // 外层滚动容器
         Column(
-
             modifier = Modifier
-                .padding(innerPadding)
+                .padding(bottom = innerPadding.calculateBottomPadding())
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState())
-                .padding(16.dp)
+                .padding(start = 16.dp, end = 16.dp, bottom = 16.dp, top = 8.dp) // 外层留白，露出底色
         ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 16.dp)
-                    .clickable { onBack() },
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    imageVector = Icons.Default.ArrowBack,
-                    contentDescription = "返回",
-                    tint = MaterialTheme.colorScheme.primary
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "返回任务列表 (任务 #${task.requestId})",
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.titleMedium
-                )
-            }
-            // 1. 状态指示器展示
-            Surface(
-                color = statusColor.copy(alpha = 0.1f),
-                shape = RoundedCornerShape(8.dp),
-                modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
-            ) {
-                Row(
-                    modifier = Modifier.padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(modifier = Modifier.size(8.dp).background(statusColor, CircleShape))
-                    Spacer(Modifier.width(12.dp))
-                    Text(
-                        text = "当前状态：$statusText",
-                        color = statusColor,
-                        fontWeight = FontWeight.Bold,
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                }
-            }
-
-            // 2. 故障描述卡片
+            // ======= 核心修改：全局包裹大卡片 =======
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color.White),
-                elevation = CardDefaults.cardElevation(1.dp)
+                shape = RoundedCornerShape(24.dp), // 大圆角
+                colors = CardDefaults.cardColors(containerColor = Color.White), // 大卡片为白色
+                elevation = CardDefaults.cardElevation(defaultElevation = 6.dp) // 增加投影，使其像一张悬浮的纸
             ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text("故障描述", style = MaterialTheme.typography.titleSmall, color = Color.Gray)
-                    HorizontalDivider(Modifier.padding(vertical = 8.dp), color = Color(0xFFF5F5F5))
-                    Text(
-                        text = task.problemDescription ?: "无详细描述",
-                        style = MaterialTheme.typography.bodyLarge,
-                        lineHeight = 24.sp
-                    )
-                }
-            }
-            Spacer(Modifier.height(16.dp))
-            //待处理入队申请
-
-            // 3. 详细信息卡片
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color.White),
-                elevation = CardDefaults.cardElevation(1.dp)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text("详细信息", style = MaterialTheme.typography.titleSmall, color = Color.Gray)
-                    HorizontalDivider(Modifier.padding(vertical = 8.dp), color = Color(0xFFF5F5F5))
-
-                    DetailItem("设备型号", "${task.deviceType} ${task.deviceModel}")
-                    DetailItem("操作系统", task.deviceSystem ?: "未知")
-                    DetailItem("报修地点", task.repairLocation ?: "未填写")
-                    DetailItem("申请人", task.realName ?: task.username)
-                    DetailItem("联系方式", task.contactInfo ?: "未提供")
-                    DetailItem("申请时间", task.createTime?.replace("T", " ")?.substringBefore(".") ?: "未知")
-                }
-            }
-
-
-
-            // 4. 接单员信息卡片 (任务已被接收且有分配记录时显示)
-            // 4. 接单信息卡片 (展示小队所有成员)
-            if (!task.repairAssignment.isNullOrEmpty() && task.status >= 2) {
-                Spacer(Modifier.height(16.dp))
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = Color.White),
-                    elevation = CardDefaults.cardElevation(1.dp)
+                // 卡片内部的布局容器
+                Column(
+                    modifier = Modifier.padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text("接单小队信息", style = MaterialTheme.typography.titleSmall, color = Color.Gray)
-                        HorizontalDivider(Modifier.padding(vertical = 8.dp), color = Color(0xFFF5F5F5))
+                    // --- 1. 跟随滚动的顶部栏（返回 + 标题）---
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(
+                            onClick = onBack,
+                            modifier = Modifier.size(36.dp).offset(x = (-8).dp) // 稍微向左偏移贴紧边缘
+                        ) {
+                            Icon(Icons.Default.ArrowBack, contentDescription = "返回", tint = Color(0xFF1D1D1F))
+                        }
+                        Text(
+                            text = "任务详情 #${task.requestId}",
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize = 20.sp,
+                            color = Color(0xFF1D1D1F)
+                        )
+                    }
 
-                        // 1. 渲染正式成员 (status != 5)
-                        val confirmedMembers = task.repairAssignment.filter { it.status != 5 }
-                        confirmedMembers.forEachIndexed { index, assignment ->
+                    // --- 2. 状态指示器展示 ---
+                    Surface(
+                        color = statusColor.copy(alpha = 0.08f),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(modifier = Modifier.size(10.dp).background(statusColor, CircleShape))
+                            Spacer(Modifier.width(12.dp))
+                            Text(
+                                text = "当前状态：$statusText",
+                                color = statusColor,
+                                fontWeight = FontWeight.Bold,
+                                style = MaterialTheme.typography.titleMedium
+                            )
+                        }
+                    }
+
+                    // --- 3. 专属推荐横幅 ---
+                    if (task.isExpertMatch == true && isVolunteerOrAdmin && task.status < 2) {
+                        Surface(
+                            color = Color(0xFFFFF7ED),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                            border = BorderStroke(1.dp, Color(0xFFFFEDD5))
+                        ) {
                             Row(
-                                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                modifier = Modifier.padding(16.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                AvatarImage(path = assignment.avatar, modifier = Modifier.size(40.dp))
-                                Spacer(Modifier.width(12.dp))
-
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text(text = assignment.volunteerName ?: "未知成员", fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                                        Spacer(Modifier.width(8.dp))
-                                        val isLeader = assignment.isLeader == 1
-                                        Surface(
-                                            color = if (isLeader) Color(0xFFFF9800).copy(alpha = 0.1f) else Color(0xFF2196F3).copy(alpha = 0.1f),
-                                            shape = RoundedCornerShape(4.dp)
-                                        ) {
-                                            Text(
-                                                text = if (isLeader) "负责人" else "队员",
-                                                color = if (isLeader) Color(0xFFFF9800) else Color(0xFF2196F3),
-                                                fontSize = 10.sp,
-                                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                        }
-                                    }
-                                    Text(text = "${assignment.majorClass ?: ""} ${assignment.grade ?: ""}", color = Color.Gray, fontSize = 12.sp)
-                                }
-                            }
-                            // 只有当后面还有正式成员，或者你是负责人且后面有申请人时，才画线
-                            val pendingApplicants = task.repairAssignment.filter { it.status == 5 }
-                            if (index < confirmedMembers.size - 1 || (isLeaderOfTask && pendingApplicants.isNotEmpty())) {
-                                HorizontalDivider(color = Color(0xFFFAFAFA), thickness = 0.5.dp)
-                            }
-                        }
-
-                        // 2. 渲染待审核申请 (嵌入在同一个卡片内，仅负责人可见)
-                        val pendingApplicants = task.repairAssignment.filter { it.status == 5 }
-                        if (isLeaderOfTask && pendingApplicants.isNotEmpty()) {
-                            Spacer(Modifier.height(8.dp))
-                            pendingApplicants.forEach { applicant ->
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .background(Color(0xFFFFF9C4).copy(alpha = 0.3f), RoundedCornerShape(8.dp))
-                                        .padding(8.dp),
-                                    verticalAlignment = Alignment.CenterVertically
+                                Surface(
+                                    color = Color(0xFFFFF1F2),
+                                    shape = CircleShape,
+                                    modifier = Modifier.size(40.dp)
                                 ) {
-                                    AvatarImage(path = applicant.avatar, modifier = Modifier.size(32.dp))
-                                    Spacer(Modifier.width(8.dp))
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(applicant.volunteerName ?: "申请人", fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                                        Text("申请加入小队...", fontSize = 11.sp, color = Color(0xFFFBC02D))
-                                    }
-
-                                    // 同意
-                                    IconButton(onClick = {
-                                        handleJoinRequestAudit(applicant.assignId, true, token, scope, context, onRefresh, onBack)
-                                    }, modifier = Modifier.size(32.dp)) {
-                                        Icon(Icons.Default.CheckCircle, null, tint = Color(0xFF43A047))
-                                    }
-                                    // 拒绝
-                                    IconButton(onClick = {
-                                        handleJoinRequestAudit(applicant.assignId, false, token, scope, context, onRefresh, onBack)
-                                    }, modifier = Modifier.size(32.dp)) {
-                                        Icon(Icons.Default.Cancel, null, tint = Color(0xFFD32F2F))
-                                    }
+                                    Icon(Icons.Default.Star, contentDescription = null, tint = Color(0xFFF97316), modifier = Modifier.padding(8.dp))
+                                }
+                                Spacer(Modifier.width(12.dp))
+                                Column {
+                                    Text("✨ 专属推荐", color = Color(0xFFC2410C), fontWeight = FontWeight.ExtraBold, fontSize = 15.sp)
+                                    Spacer(Modifier.height(4.dp))
+                                    Text(
+                                        text = "系统检测到您擅长处理【${task.category ?: "此类"}】问题，推荐您接取！",
+                                        color = Color(0xFF9A3412),
+                                        fontSize = 13.sp,
+                                        lineHeight = 18.sp
+                                    )
                                 }
                             }
                         }
                     }
-                }
-            }
 
-            // 5. 【新增】维修结单报告展示区 (仅在任务已完成 status >= 3 且存在结单记录时显示)
-            if (task.status >= 3 && completionLog != null) {
-                Spacer(Modifier.height(16.dp))
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = Color.White),
-                    elevation = CardDefaults.cardElevation(1.dp)
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text("维修结单报告", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = Color(0xFF2196F3))
-                        HorizontalDivider(Modifier.padding(vertical = 12.dp), color = Color(0xFFEEEEEE))
+                    // --- 4. 故障描述卡片 (微调内部底色) ---
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F8FA)), // 微弱的灰底区分层次
+                        shape = RoundedCornerShape(16.dp),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                        border = BorderStroke(0.5.dp, Color(0xFFE5E5EA))
+                    ) {
+                        Column(modifier = Modifier.padding(20.dp)) {
+                            Text("故障描述", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = Color(0xFF1D1D1F))
+                            HorizontalDivider(Modifier.padding(vertical = 12.dp), color = Color(0xFFE5E5EA))
+                            Text(
+                                text = task.problemDescription ?: "无详细描述",
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = Color(0xFF48484A),
+                                lineHeight = 24.sp
+                            )
+                        }
+                    }
 
-                        // 展示填写的表单内容
-                        DetailItem("故障原因", completionLog.logContent ?: "未填写")
-                        DetailItem("维修时长", completionLog.repairDuration ?: "未填写")
-                        DetailItem("维修备注", completionLog.solutionSummary ?: "无")
+                    // --- 5. 详细信息卡片 ---
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F8FA)),
+                        shape = RoundedCornerShape(16.dp),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                        border = BorderStroke(0.5.dp, Color(0xFFE5E5EA))
+                    ) {
+                        Column(modifier = Modifier.padding(20.dp)) {
+                            Text("详细信息", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = Color(0xFF1D1D1F))
+                            HorizontalDivider(Modifier.padding(vertical = 12.dp), color = Color(0xFFE5E5EA))
 
-                        // 展示完成时间 (优先使用 task 上的时间)
-                        val finishTime = task.completeTime ?: completionLog.uploadTime
-                        DetailItem("完成时间", finishTime?.replace("T", " ")?.substringBefore(".") ?: "未知")
+                            if (!task.category.isNullOrEmpty()) {
+                                DetailItem("问题分类", task.category)
+                            }
+                            DetailItem("设备型号", "${task.deviceType} ${task.deviceModel}")
+                            DetailItem("操作系统", task.deviceSystem ?: "未知")
+                            DetailItem("报修地点", task.repairLocation ?: "未填写")
+                            DetailItem("申请人", task.realName ?: task.username)
+                            DetailItem("联系方式", task.contactInfo ?: "未提供")
+                            DetailItem("申请时间", task.createTime?.replace("T", " ")?.substringBefore(".") ?: "未知")
+                        }
+                    }
 
-                        Spacer(Modifier.height(16.dp))
+                    // --- 6. 接单小队信息卡片 ---
+                    if (!task.repairAssignment.isNullOrEmpty() && task.status >= 2) {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F8FA)),
+                            shape = RoundedCornerShape(16.dp),
+                            elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                            border = BorderStroke(0.5.dp, Color(0xFFE5E5EA))
+                        ) {
+                            Column(modifier = Modifier.padding(20.dp)) {
+                                Text("接单小队信息", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = Color(0xFF1D1D1F))
+                                HorizontalDivider(Modifier.padding(vertical = 12.dp), color = Color(0xFFE5E5EA))
 
-                        // “导入知识库” 预留按钮，仅对管理员和志愿者开放
-                        // “导入知识库” 按钮，仅对管理员和志愿者开放
-                        if (isVolunteerOrAdmin) {
-                            var isImporting by remember { mutableStateOf(false) }
+                                val confirmedMembersList = task.repairAssignment.filter { it.status != 5 }
+                                confirmedMembersList.forEachIndexed { index, assignment ->
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        AvatarImage(path = assignment.avatar, modifier = Modifier.size(44.dp).clip(CircleShape))
+                                        Spacer(Modifier.width(12.dp))
 
-                            OutlinedButton(
-                                onClick = {
-                                    // 1. 校验必填字段
-                                    val logId = completionLog.logId
-                                    if (logId == null) {
-                                        Toast.makeText(context, "未能获取到结单日志ID，无法导入", Toast.LENGTH_SHORT).show()
-                                        return@OutlinedButton
-                                    }
-
-                                    // 优先使用表单填写的故障原因，若没有则用用户申请时的故障描述
-                                    val problemText = completionLog.logContent?.takeIf { it.isNotBlank() }
-                                        ?: task.problemDescription
-                                        ?: "未知故障"
-
-                                    val solutionText = completionLog.repairDuration?.takeIf { it.isNotBlank() }
-                                    if (solutionText == null) {
-                                        Toast.makeText(context, "解决方案为空，无法导入知识库", Toast.LENGTH_SHORT).show()
-                                        return@OutlinedButton
-                                    }
-
-                                    // 2. 发起网络请求
-                                    isImporting = true
-                                    scope.launch {
-                                        try {
-                                            val authHeader = if (token.startsWith("Bearer ")) token else "Bearer $token"
-
-                                            // 按照要求严格构建参数：sourceType = 3，sourceId = "log_X"
-                                            val request = AddKnowledgeRequest(
-                                                problem = problemText,
-                                                solution = solutionText,
-                                                sourceType = 3,
-                                                sourceId = "log_$logId"
-                                            )
-
-                                            // 调用接口 (请确保 NetworkClient.instance 中已经包含了你定义的 addKnowledge 方法)
-                                            val response = NetworkClient.instance.addKnowledge(authHeader, request)
-
-                                            if (response.isSuccessful && response.body()?.code == 200) {
-                                                Toast.makeText(context, "成功导入知识库！这是第${response.body()?.data}条知识", Toast.LENGTH_SHORT).show()
-                                            } else {
-                                                val msg = response.body()?.msg ?: "未知错误"
-                                                Toast.makeText(context, "导入失败: $msg", Toast.LENGTH_SHORT).show()
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Text(text = assignment.volunteerName ?: "未知成员", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color(0xFF1D1D1F))
+                                                Spacer(Modifier.width(8.dp))
+                                                val isLeader = assignment.isLeader == 1
+                                                Surface(
+                                                    color = if (isLeader) Color(0xFFFFF7ED) else Color(0xFFEFF6FF),
+                                                    shape = RoundedCornerShape(50),
+                                                    border = BorderStroke(0.5.dp, if (isLeader) Color(0xFFFFEDD5) else Color(0xFFDBEAFE))
+                                                ) {
+                                                    Text(
+                                                        text = if (isLeader) "负责人" else "队员",
+                                                        color = if (isLeader) Color(0xFFEA580C) else Color(0xFF2563EB),
+                                                        fontSize = 11.sp,
+                                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                                                        fontWeight = FontWeight.Bold
+                                                    )
+                                                }
                                             }
-                                        } catch (e: Exception) {
-                                            e.printStackTrace()
-                                            Toast.makeText(context, "网络异常，导入失败", Toast.LENGTH_SHORT).show()
-                                        } finally {
-                                            isImporting = false
+                                            Spacer(Modifier.height(2.dp))
+                                            Text(text = "${assignment.majorClass ?: ""} ${assignment.grade ?: ""}", color = Color(0xFF8E8E93), fontSize = 13.sp)
                                         }
                                     }
-                                },
-                                modifier = Modifier.fillMaxWidth(),
-                                enabled = !isImporting, // 导入中禁用按钮
-                                border = BorderStroke(1.dp, Color(0xFF2196F3)),
-                                colors = ButtonDefaults.outlinedButtonColors(
-                                    contentColor = Color(0xFF2196F3),
-                                    disabledContentColor = Color.Gray
-                                )
-                            ) {
-                                if (isImporting) {
-                                    // 显示加载动画
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(18.dp),
-                                        color = Color(0xFF2196F3),
-                                        strokeWidth = 2.dp
-                                    )
-                                    Spacer(Modifier.width(8.dp))
-                                    Text("正在导入...", fontWeight = FontWeight.Medium)
-                                } else {
-                                    Icon(Icons.Default.Add, contentDescription = "Import", modifier = Modifier.size(18.dp))
-                                    Spacer(Modifier.width(8.dp))
-                                    Text("将此方案导入知识库", fontWeight = FontWeight.Medium)
+                                    val pendingApplicantsList = task.repairAssignment.filter { it.status == 5 }
+                                    if (index < confirmedMembersList.size - 1 || (isLeaderOfTask && pendingApplicantsList.isNotEmpty())) {
+                                        HorizontalDivider(color = Color(0xFFE5E5EA), thickness = 1.dp, modifier = Modifier.padding(vertical = 4.dp))
+                                    }
+                                }
+
+                                val pendingApplicantsList = task.repairAssignment.filter { it.status == 5 }
+                                if (isLeaderOfTask && pendingApplicantsList.isNotEmpty()) {
+                                    Spacer(Modifier.height(8.dp))
+                                    pendingApplicantsList.forEach { applicant ->
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(vertical = 4.dp)
+                                                .background(Color(0xFFFEF9C3).copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                                                .padding(12.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            AvatarImage(path = applicant.avatar, modifier = Modifier.size(36.dp).clip(CircleShape))
+                                            Spacer(Modifier.width(10.dp))
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(applicant.volunteerName ?: "申请人", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1D1D1F))
+                                                Text("申请加入小队...", fontSize = 12.sp, color = Color(0xFFCA8A04))
+                                            }
+
+                                            IconButton(onClick = {
+                                                handleJoinRequestAudit(applicant.assignId, true, token, scope, context, onRefresh, onBack)
+                                            }, modifier = Modifier.size(36.dp)) {
+                                                Icon(Icons.Default.CheckCircle, null, tint = Color(0xFF22C55E), modifier = Modifier.size(28.dp))
+                                            }
+                                            Spacer(Modifier.width(4.dp))
+                                            IconButton(onClick = {
+                                                handleJoinRequestAudit(applicant.assignId, false, token, scope, context, onRefresh, onBack)
+                                            }, modifier = Modifier.size(36.dp)) {
+                                                Icon(Icons.Default.Cancel, null, tint = Color(0xFFEF4444), modifier = Modifier.size(28.dp))
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
+
+                    // --- 7. 维修结单报告展示区 ---
+                    if (task.status >= 3 && completionLog != null) {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F8FA)),
+                            shape = RoundedCornerShape(16.dp),
+                            elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                            border = BorderStroke(0.5.dp, Color(0xFFE5E5EA))
+                        ) {
+                            Column(modifier = Modifier.padding(20.dp)) {
+                                Text("维修结单报告", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = Color(0xFF2563EB))
+                                HorizontalDivider(Modifier.padding(vertical = 12.dp), color = Color(0xFFE5E5EA))
+
+                                DetailItem("故障原因", completionLog.logContent ?: "未填写")
+                                DetailItem("维修时长", completionLog.repairDuration ?: "未填写")
+                                DetailItem("维修备注", completionLog.solutionSummary ?: "无")
+
+                                val finishTime = task.completeTime ?: completionLog.uploadTime
+                                DetailItem("完成时间", finishTime?.replace("T", " ")?.substringBefore(".") ?: "未知")
+
+                                if (isVolunteerOrAdmin) {
+                                    Spacer(Modifier.height(20.dp))
+                                    var isImporting by remember { mutableStateOf(false) }
+
+                                    OutlinedButton(
+                                        onClick = {
+                                            val logId = completionLog.logId
+                                            if (logId == null) {
+                                                Toast.makeText(context, "未能获取到结单日志ID，无法导入", Toast.LENGTH_SHORT).show()
+                                                return@OutlinedButton
+                                            }
+
+                                            val problemText = completionLog.logContent?.takeIf { it.isNotBlank() }
+                                                ?: task.problemDescription
+                                                ?: "未知故障"
+
+                                            val solutionText = completionLog.repairDuration?.takeIf { it.isNotBlank() }
+                                            if (solutionText == null) {
+                                                Toast.makeText(context, "解决方案为空，无法导入知识库", Toast.LENGTH_SHORT).show()
+                                                return@OutlinedButton
+                                            }
+
+                                            isImporting = true
+                                            scope.launch {
+                                                try {
+                                                    val authHeader = if (token.startsWith("Bearer ")) token else "Bearer $token"
+                                                    val request = AddKnowledgeRequest(
+                                                        problem = problemText,
+                                                        solution = solutionText,
+                                                        sourceType = 3,
+                                                        sourceId = "log_$logId"
+                                                    )
+                                                    val response = NetworkClient.instance.addKnowledge(authHeader, request)
+
+                                                    if (response.isSuccessful && response.body()?.code == 200) {
+                                                        Toast.makeText(context, "成功导入知识库！这是第${response.body()?.data}条知识", Toast.LENGTH_SHORT).show()
+                                                    } else {
+                                                        val msg = response.body()?.msg ?: "未知错误"
+                                                        Toast.makeText(context, "导入失败: $msg", Toast.LENGTH_SHORT).show()
+                                                    }
+                                                } catch (e: Exception) {
+                                                    e.printStackTrace()
+                                                    Toast.makeText(context, "网络异常，导入失败", Toast.LENGTH_SHORT).show()
+                                                } finally {
+                                                    isImporting = false
+                                                }
+                                            }
+                                        },
+                                        modifier = Modifier.fillMaxWidth().height(48.dp),
+                                        enabled = !isImporting,
+                                        border = BorderStroke(1.dp, Color(0xFF2563EB)),
+                                        shape = RoundedCornerShape(12.dp),
+                                        colors = ButtonDefaults.outlinedButtonColors(
+                                            contentColor = Color(0xFF2563EB),
+                                            disabledContentColor = Color.Gray
+                                        )
+                                    ) {
+                                        if (isImporting) {
+                                            CircularProgressIndicator(modifier = Modifier.size(18.dp), color = Color(0xFF2563EB), strokeWidth = 2.dp)
+                                            Spacer(Modifier.width(8.dp))
+                                            Text("正在导入...", fontWeight = FontWeight.Bold)
+                                        } else {
+                                            Icon(Icons.Default.Add, contentDescription = "Import", modifier = Modifier.size(18.dp))
+                                            Spacer(Modifier.width(8.dp))
+                                            Text("将此方案导入知识库", fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // --- 8. 展示结单填写表单 ---
+                    if (task.status == 2 && isLeaderOfTask && currentVolunteerId != null) {
+                        TaskCompletionForm(
+                            requestId = task.requestId,
+                            volunteerId = currentVolunteerId,
+                            userToken = token,
+                            onCompleteSuccess = {
+                                onRefresh()
+                                onBack()
+                            }
+                        )
+                    }
+
+                    // 内部防遮挡留白
+                    Spacer(modifier = Modifier.height(8.dp))
                 }
             }
-
-            // 6. 展示结单填写表单 (仅在“维修中”且“属于当前志愿者的任务”时显示)
-            if (task.status == 2 && isLeaderOfTask && currentVolunteerId != null) {
-                Spacer(Modifier.height(16.dp))
-                TaskCompletionForm(
-                    requestId = task.requestId,
-                    volunteerId = currentVolunteerId,
-                    userToken = token,
-                    onCompleteSuccess = {
-                        onRefresh()
-                        onBack()
-                    }
-                )
-            }
-
-            // 底部留白，防止被导航栏遮挡
-            Spacer(Modifier.height(32.dp))
         }
+
+        // 评价弹窗保持不变
         if (showEvalDialog) {
             AlertDialog(
                 onDismissRequest = { if (!isSubmittingEval) showEvalDialog = false },
-                title = { Text("服务评价", fontWeight = FontWeight.Bold) },
+                shape = RoundedCornerShape(20.dp),
+                containerColor = Color.White,
+                title = { Text("服务评价", fontWeight = FontWeight.ExtraBold, fontSize = 20.sp, color = Color(0xFF1D1D1F)) },
                 text = {
                     Column {
-                        Text("请为本次义修服务打分：")
-                        Spacer(modifier = Modifier.height(8.dp))
-                        // 简易星级评分条
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+                        Text("请为本次义修服务打分：", color = Color(0xFF48484A))
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.Center
+                        ) {
                             for (i in 1..5) {
                                 IconButton(onClick = { evalScore = i }) {
                                     Icon(
-                                        imageVector = if (i <= evalScore) Icons.Filled.Star else Icons.Outlined.StarBorder,
+                                        imageVector = if (i <= evalScore) Icons.Filled.Star else Icons.Outlined.Star,
                                         contentDescription = "Star $i",
-                                        tint = if (i <= evalScore) Color(0xFFFFB300) else Color.Gray,
-                                        modifier = Modifier.size(36.dp)
+                                        tint = if (i <= evalScore) Color(0xFFFFB300) else Color(0xFFE5E5EA),
+                                        modifier = Modifier.size(44.dp)
                                     )
                                 }
                             }
                         }
-                        Spacer(modifier = Modifier.height(16.dp))
+
+                        Spacer(modifier = Modifier.height(24.dp))
+
                         OutlinedTextField(
                             value = evalContent,
                             onValueChange = { evalContent = it },
                             label = { Text("评价内容 (选填)") },
                             modifier = Modifier.fillMaxWidth(),
-                            minLines = 3
+                            minLines = 3,
+                            shape = RoundedCornerShape(12.dp),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = Color(0xFF2196F3),
+                                unfocusedBorderColor = Color(0xFFE5E5EA)
+                            )
                         )
                     }
                 },
@@ -4068,8 +4178,8 @@ fun TaskDetailScreen(
                                     if (response.isSuccessful && response.body()?.code == 200) {
                                         Toast.makeText(context, "评价成功！", Toast.LENGTH_SHORT).show()
                                         showEvalDialog = false
-                                        onRefresh() // 刷新详情页或列表
-                                        onBack()    // 自动退回历史页面
+                                        onRefresh()
+                                        onBack()
                                     } else {
                                         Toast.makeText(context, "评价失败: ${response.body()?.msg}", Toast.LENGTH_SHORT).show()
                                     }
@@ -4080,17 +4190,21 @@ fun TaskDetailScreen(
                                 }
                             }
                         },
-                        enabled = !isSubmittingEval
+                        enabled = !isSubmittingEval,
+                        shape = RoundedCornerShape(10.dp)
                     ) {
-                        if (isSubmittingEval) CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White)
-                        else Text("提交评价")
+                        if (isSubmittingEval) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
+                        } else {
+                            Text("提交评价", fontWeight = FontWeight.Bold)
+                        }
                     }
                 },
                 dismissButton = {
                     TextButton(
                         onClick = { showEvalDialog = false },
                         enabled = !isSubmittingEval
-                    ) { Text("取消", color = Color.Gray) }
+                    ) { Text("取消", color = Color(0xFF8E8E93), fontWeight = FontWeight.Bold) }
                 }
             )
         }
@@ -4269,126 +4383,151 @@ fun NotificationCard(item: NotifyItem, onClick: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun NotificationDetailScreen(
     notification: NotifyItem,
     onBack: () -> Unit
 ) {
-    // 拦截系统返回键（侧滑/实体键）
+    // 监听系统返回键
     BackHandler { onBack() }
 
-    // 【核心修改】：直接移除 Scaffold，使用 Column 作为根布局
-    Column(
+    Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFFF5F5F5)) // 把原本 Scaffold 的背景色移到这里
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp)
+            .background(Color(0xFFEBEBF0)) // 页面底色：高级灰
     ) {
-        Row(
+        Column(
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 16.dp) // 与下方卡片保持间距
-                .clickable { onBack() }, // 点击触发状态改变，回到列表
-            verticalAlignment = Alignment.CenterVertically
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                // 【修复1】：将 top = 32.dp 改为 0.dp，让大卡片彻底贴顶
+                .padding(start = 16.dp, end = 16.dp, bottom = 16.dp, top = 16.dp)
         ) {
-            Icon(
-                imageVector = Icons.Default.ArrowBack,
-                contentDescription = "返回",
-                tint = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(18.dp)
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                text = "返回消息列表",
-                color = MaterialTheme.colorScheme.primary,
-                fontWeight = FontWeight.Bold,
-                style = MaterialTheme.typography.titleSmall
-            )
-        }
-        // 头部信息卡片
-        Card(
-            colors = CardDefaults.cardColors(containerColor = Color.White),
-            modifier = Modifier.fillMaxWidth(),
-            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
-        ) {
-            Column(modifier = Modifier.padding(20.dp)) {
-                // 类型标签
-                Surface(
-                    color = when (notification.type) {
-                        "SYSTEM" -> MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)
-                        "BROADCAST" -> Color(0xFFFFA000).copy(alpha = 0.1f)
-                        else -> Color.Gray.copy(alpha = 0.1f)
-                    },
-                    shape = RoundedCornerShape(4.dp)
+            // ======= 全局包裹大卡片 (已清理重复嵌套的错误 Card) =======
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
+                elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
+            ) {
+                // 外层容器：去掉了全局统一的 padding，方便内部组件自由控制边距
+                Column(
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text(
-                        text = when (notification.type) {
-                            "SYSTEM" -> "系统通知"
-                            "BROADCAST" -> "全员广播"
-                            "USER" -> "用户私信"
-                            else -> "通知"
-                        },
-                        style = MaterialTheme.typography.labelMedium,
-                        color = when (notification.type) {
-                            "SYSTEM" -> MaterialTheme.colorScheme.primary
-                            "BROADCAST" -> Color(0xFFFFA000)
-                            else -> Color.Gray
-                        },
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                    )
-                }
+                    // 状态栏防遮挡占位符 (有了它，外层就算贴顶也不会被刘海遮挡)
+                    Spacer(modifier = Modifier.windowInsetsTopHeight(WindowInsets.statusBars))
 
-                Spacer(modifier = Modifier.height(12.dp))
+                    // --- 1. 顶部栏（独立边距，完美贴紧左上角）---
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            // 【修复2】：将 top 改为 0.dp，消除内部物理缝隙
+                            .padding(start = 4.dp, top = 4.dp, bottom = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(
+                            onClick = onBack,
+                            // 【修复3】：使用负数 offset 抵消按钮自带的透明触摸区，使其真正贴紧左边缘和上边缘
+                            modifier = Modifier.size(36.dp).offset(x = (-4).dp, y = (-4).dp)
+                        ) {
+                            Icon(Icons.Default.ArrowBack, contentDescription = "返回", tint = Color(0xFF1D1D1F))
+                        }
+                        Text(
+                            text = "消息详情",
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize = 20.sp,
+                            color = Color(0xFF1D1D1F),
+                            // 【修复4】：文字同步向上微调，和箭头保持完美对齐
+                            modifier = Modifier.offset(y = (-4).dp)
+                        )
+                    }
 
-                Text(
-                    text = notification.title,
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.Bold
-                )
+                    // --- 其他内容区（保持舒适的阅读间距） ---
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            // 为正文部分单独保留 20dp 的左右与底部留白
+                            .padding(horizontal = 20.dp)
+                            .padding(bottom = 20.dp),
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        // --- 2. 消息分类与时间区块 ---
+                        Surface(
+                            color = Color(0xFFF7F8FA),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(16.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                val (typeText, typeColor) = when(notification.type) {
+                                    "SYSTEM" -> "系统消息" to Color(0xFF1976D2)
+                                    "BROADCAST" -> "广播消息" to Color(0xFF43A047)
+                                    "USER" -> "用户消息" to Color(0xFFE91E63)
+                                    else -> "通知消息" to Color.Gray
+                                }
 
-                Spacer(modifier = Modifier.height(8.dp))
+                                Surface(
+                                    color = typeColor.copy(alpha = 0.1f),
+                                    shape = RoundedCornerShape(50)
+                                ) {
+                                    Text(
+                                        text = typeText,
+                                        color = typeColor,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                                    )
+                                }
 
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.AccessTime, null, modifier = Modifier.size(14.dp), tint = Color.Gray)
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(
-                        text = notification.createTime.replace("T", " "),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color.Gray
-                    )
-                    Spacer(modifier = Modifier.width(16.dp))
-                    Icon(Icons.Default.Person, null, modifier = Modifier.size(14.dp), tint = Color.Gray)
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(
-                        text = notification.senderUsername ?: "系统管理员",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color.Gray
-                    )
+                                Text(
+                                    text = notification.createTime.take(16).replace("T", " "),
+                                    color = Color.Gray,
+                                    fontSize = 12.sp
+                                )
+                            }
+                        }
+
+                        // --- 3. 消息标题 ---
+                        Text(
+                            text = notification.title ?: "无标题",
+                            fontSize = 22.sp,
+                            fontWeight = FontWeight.Black,
+                            color = Color(0xFF1A1A1A),
+                            lineHeight = 30.sp
+                        )
+
+                        HorizontalDivider(color = Color(0xFFF0F0F0), thickness = 1.dp)
+
+                        // --- 4. 故障描述/正文卡片 ---
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F8FA)),
+                            shape = RoundedCornerShape(16.dp),
+                            elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                            border = BorderStroke(0.5.dp, Color(0xFFE5E5EA))
+                        ) {
+                            Column(modifier = Modifier.padding(20.dp)) {
+                                Text(
+                                    text = notification.content ?: "无内容",
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = Color(0xFF48484A),
+                                    lineHeight = 28.sp
+                                )
+                            }
+                        }
+                    }
                 }
             }
-        }
 
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // 内容卡片
-        Card(
-            colors = CardDefaults.cardColors(containerColor = Color.White),
-            modifier = Modifier.fillMaxWidth(),
-            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
-        ) {
-            Column(modifier = Modifier.padding(20.dp)) {
-                Text(
-                    text = notification.content,
-                    style = MaterialTheme.typography.bodyLarge,
-                    lineHeight = 24.sp,
-                    color = Color(0xFF333333)
-                )
-            }
+            // 底部防遮挡留白
+            Spacer(modifier = Modifier.height(32.dp))
         }
     }
 }
-
 @Composable
 private fun ChatBubble(message: ChatMessage) {
     val isUser = message.role == Role.USER
@@ -4450,14 +4589,25 @@ fun TaskCompletionForm(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    // --- 定义用户需要填写的表单状态 (请根据实际情况增删) ---
+    // --- 定义用户需要填写的表单状态 ---
     var faultReason by remember { mutableStateOf("") }
     var solution by remember { mutableStateOf("") }
     var remarks by remember { mutableStateOf("") }
 
+    // 【新增】图片选择状态
+    var selectedImages by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var isSubmitting by remember { mutableStateOf(false) }
 
-    // 【核心逻辑】只有所有必填项都不为空白时，才允许点击完成按钮
+    // 【新增】图片选择器
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickMultipleVisualMedia(3) // 限制最多选3张，可根据需求修改
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            selectedImages = (selectedImages + uris).distinct()
+        }
+    }
+
+    // 只有所有必填项都不为空白时，才允许点击完成按钮
     val isFormValid = faultReason.isNotBlank() && solution.isNotBlank() && remarks.isNotBlank()
 
     Card(
@@ -4513,14 +4663,60 @@ fun TaskCompletionForm(
             )
             Spacer(modifier = Modifier.height(24.dp))
 
-            // 4. 提交按钮
+            // 【新增】 4. 图片上传区域
+            Text("上传维修图片 (${selectedImages.size}/3)", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(8.dp))
+
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                item {
+                    OutlinedButton(
+                        onClick = {
+                            photoPickerLauncher.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            )
+                        },
+                        modifier = Modifier.size(80.dp),
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(0.dp)
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = "添加")
+                    }
+                }
+
+                items(selectedImages) { uri ->
+                    Box(modifier = Modifier.size(80.dp)) {
+                        AsyncImage(
+                            model = uri,
+                            contentDescription = null,
+                            modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(8.dp)),
+                            contentScale = ContentScale.Crop
+                        )
+                        IconButton(
+                            onClick = { selectedImages = selectedImages - uri },
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .size(24.dp)
+                                .background(Color.White.copy(alpha = 0.7f), CircleShape)
+                        ) {
+                            Icon(Icons.Default.Close, contentDescription = "删除", tint = Color.Red, modifier = Modifier.padding(4.dp))
+                        }
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(24.dp))
+
+            // 5. 提交按钮
             Button(
                 onClick = {
                     isSubmitting = true
                     scope.launch {
                         try {
                             val authHeader = if (userToken.startsWith("Bearer ")) userToken else "Bearer $userToken"
-                            // 构造请求，requestId 和 volunteerId 由外部传入，对用户透明
+
+                            // ===== 第一步：提交文字结单 =====
                             val request = CompleteTaskRequest(
                                 requestId = requestId,
                                 volunteerId = volunteerId,
@@ -4529,16 +4725,39 @@ fun TaskCompletionForm(
                                 solutionSummary = remarks
                             )
 
-                            // 发起网络请求 (请确保 NetworkClient.instance 中包含了 ApiService 实例)
-                            val response = NetworkClient.instance.completeRepairTask(authHeader, request)
+                            val textResponse = NetworkClient.instance.completeRepairTask(authHeader, request)
 
-                            if (response.isSuccessful && response.body()?.code == 200) {
+                            if (textResponse.isSuccessful && textResponse.body()?.code == 200) {
+
+                                // ===== 第二步：如果包含图片，则调用图片上传接口 =====
+                                if (selectedImages.isNotEmpty()) {
+                                    val requestIdBody = requestId.toString().toRequestBody("text/plain".toMediaTypeOrNull())
+                                    val parts = mutableListOf<MultipartBody.Part>()
+
+                                    // 转换 Uri 为 File 并打包为 MultipartBody.Part
+                                    selectedImages.forEach { uri ->
+                                        val file = uriToFileHelper(context, uri)
+                                        if (file != null) {
+                                            val requestFile = file.asRequestBody("image/*".toMediaTypeOrNull())
+                                            // 注意这里的 "img" 必须和 Apifox 图中的参数名严格一致
+                                            parts.add(MultipartBody.Part.createFormData("img", file.name, requestFile))
+                                        }
+                                    }
+
+                                    if (parts.isNotEmpty()) {
+                                        val imgResponse = NetworkClient.instance.uploadTaskImage(authHeader, requestIdBody, parts)
+                                        if (!imgResponse.isSuccessful || imgResponse.body()?.code != 200) {
+                                            Toast.makeText(context, "日志提交成功，但部分图片上传失败", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                }
+
                                 Toast.makeText(context, "结单成功！", Toast.LENGTH_SHORT).show()
-                                onCompleteSuccess() // 触发成功回调（例如：刷新页面或返回上一页）
+                                onCompleteSuccess()
+
                             } else {
-                                val errorMsg = response.body()?.msg ?: "未知错误"
-                                val errorCode = response.body()?.code
-                                Log.e("TaskDebug","出现错误：${errorMsg},${errorCode}")
+                                val errorMsg = textResponse.body()?.msg ?: "未知错误"
+                                Log.e("TaskDebug","结单文字提交失败：${errorMsg}")
                                 Toast.makeText(context, "结单失败: $errorMsg", Toast.LENGTH_SHORT).show()
                             }
                         } catch (e: Exception) {
@@ -4550,7 +4769,7 @@ fun TaskCompletionForm(
                     }
                 },
                 modifier = Modifier.fillMaxWidth().height(48.dp),
-                enabled = isFormValid && !isSubmitting, // 表单不完整或正在提交时禁用按钮
+                enabled = isFormValid && !isSubmitting,
                 shape = RoundedCornerShape(8.dp)
             ) {
                 if (isSubmitting) {
@@ -4562,7 +4781,6 @@ fun TaskCompletionForm(
         }
     }
 }
-
 /**
  * 申请加入义修小队逻辑
  */
@@ -4578,8 +4796,10 @@ private fun handleJoinTeam(
     scope.launch {
         try {
             val request = AddJoinRequest(volunteerId = volunteerId, requestId = requestId)
+            val notify_request = JoinNotificationRequest(taskId = requestId)
             // 调用接口
             NetworkClient.instance.addJoinRequest(authHeader, request)
+            NetworkClient.instance.joinNotification(authHeader, notify_request)
             // 由于该接口定义的返回值为 Unit，我们直接提示成功并刷新
             Toast.makeText(context, "申请加入成功！", Toast.LENGTH_SHORT).show()
             onRefresh()
@@ -4621,5 +4841,23 @@ private fun handleJoinRequestAudit(
         } catch (e: Exception) {
             Toast.makeText(context, "网络异常", Toast.LENGTH_SHORT).show()
         }
+    }
+}
+
+private fun uriToFileHelper(context: Context, uri: Uri): File? {
+    return try {
+        val contentResolver = context.contentResolver
+        val fileName = "repair_${System.currentTimeMillis()}_${UUID.randomUUID()}.jpg"
+        val tempFile = File(context.cacheDir, fileName)
+
+        val inputStream = contentResolver.openInputStream(uri) ?: return null
+        val outputStream = FileOutputStream(tempFile)
+        inputStream.copyTo(outputStream)
+        inputStream.close()
+        outputStream.close()
+        tempFile
+    } catch (e: Exception) {
+        e.printStackTrace()
+        null
     }
 }

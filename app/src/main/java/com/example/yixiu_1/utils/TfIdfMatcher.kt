@@ -35,5 +35,20 @@ object TfIdfMatcher {
         val total = tokens.size.toDouble()
         return countMap.mapValues { it.value / total }
     }
+    /**
+     * 新增：知识库覆盖率匹配算法 (针对长句匹配短句的场景)
+     * @param userKeywords 用户提问提取出的关键词列表
+     * @param kbKeywords 知识库条目提取出的关键词列表
+     * @return 匹配得分 (0.0 到 1.0)
+     */
+    fun calculateCoverageMatch(userKeywords: List<String>, kbKeywords: List<String>): Double {
+        if (kbKeywords.isEmpty()) return 0.0
+
+        // 计算交集：用户提问中命中了几个知识库的关键词
+        val matchCount = userKeywords.intersect(kbKeywords.toSet()).size
+
+        // 核心：分母是知识库的词数，而不是用户的词数
+        return matchCount.toDouble() / kbKeywords.size
+    }
 }
 

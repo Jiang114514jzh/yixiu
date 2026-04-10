@@ -10,6 +10,10 @@ import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.*
 import java.util.concurrent.TimeUnit
 
+import com.example.yixiu_1.network.DoubaoChatRequest
+import com.example.yixiu_1.network.DoubaoMessage
+import com.example.yixiu_1.network.NetworkClient
+
 private const val DEFAULT_MODEL = "doubao-seed-1-6-lite-251015"
 private const val MAX_TOKENS = 65535
 
@@ -207,7 +211,7 @@ object DoubaoApiClient {
         level = HttpLoggingInterceptor.Level.BODY
     }
 
-    private val okHttpClient: OkHttpClient = OkHttpClient.Builder()
+   private val okHttpClient: OkHttpClient = OkHttpClient.Builder()
         .addInterceptor(loggingInterceptor)
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
@@ -348,5 +352,74 @@ class DoubaoApiHelper {
             Log.e("ChatDebug", "【标题生成】代码异常: ${e.message}")
             userMsg.take(7)
         }
+    }
+}
+
+suspend fun classifyProblemWithAI(problemDescription: String): String {
+    // 1. 定义固定的 5 个分类
+    val validCategories = listOf("软件系统", "网络通讯", "硬件维修", "移动外设", "综合咨询")
+
+    // 2. 精准的 Prompt 设计
+    val systemPrompt = """
+        你是一个校园电脑维修单分类引擎。请根据用户的报修描述，将其归类到以下5个固定类别之一：
+        [软件系统, 网络通讯, 硬件维修, 移动外设, 综合咨询]。
+        
+        【严格要求】：
+        1. 必须且只能输出这5个词中的一个。
+        2. 绝对不能包含任何标点符号、解释性文字或多余字符。
+        3. 如果实在无法判断，请输出“综合咨询”。
+    """.trimIndent()
+
+    val userPrompt = "用户描述：\"$problemDescription\" \n分类结果："
+
+    val messages = listOf(
+        DoubaoMessage(role = "system", content = systemPrompt),
+        DoubaoMessage(role = "user", content = userPrompt)
+    )
+
+    val request = DoubaoChatRequest(
+        model = "doubao-seed-1-6-lite-251015", // 使用你现有的模型
+        max_completion_tokens = 10,            // 限制输出长度，防止废话
+        messages = messages
+    )
+
+    return try {
+        // 1. 获取你在 DoubaoApiClient 中配置好的 API Key
+        val apiKey = DoubaoApiClient.getApiKey() ?: return "综合咨询"
+
+        // 2. 使用正确的实例 (DoubaoApiClient.instance) 和正确的方法 (chatCompletion)
+        val response = DoubaoApiClient.instance.chatCompletion(
+            authorization = "Bearer $apiKey",
+            request = request
+        )
+
+        if (response.isSuccessful) {
+            // 解析返回值 (参考了你 DoubaoApiService.kt 里的解析逻辑)
+            val rawContent = response.body()?.choices?.firstOrNull()?.message?.content
+            val extractedStr = when (rawContent) {
+                is String -> rawContent
+                is List<*> -> {
+                    val first = rawContent.firstOrNull()
+                    if (first is Map<*, *>) first["text"]?.toString() ?: "" else ""
+                }
+                else -> rawContent?.toString() ?: ""
+            }
+
+            val cleanResult = extractedStr.trim().replace(Regex("[\n\r\"'*\\[\\]]"), "")
+
+            // 3. 安全校验：验证 AI 返回的词是否在我们的固定列表中
+            if (validCategories.contains(cleanResult)) {
+                cleanResult
+            } else {
+                Log.w("AI_Classify", "AI 返回了不在列表中的分类: $cleanResult")
+                "综合咨询" // 兜底分类
+            }
+        } else {
+            Log.e("AI_Classify", "AI 请求失败: ${response.errorBody()?.string()}")
+            "综合咨询"
+        }
+    } catch (e: Exception) {
+        Log.e("AI_Classify", "AI 分类发生网络异常", e)
+        "综合咨询"
     }
 }

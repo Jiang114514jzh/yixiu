@@ -69,9 +69,10 @@ import java.util.UUID
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.example.yixiu_1.network.*
-import com.example.yixiu_1.network.AddCommentRequest
-import com.example.yixiu_1.network.AddReplyRequest
-import com.example.yixiu_1.network.ModifyCommentLikeRequest
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.text.style.TextAlign
+import com.example.yixiu_1.ui.CommentActionButton
 
 // ================== 评论系统数据模型 ==================
 
@@ -477,7 +478,6 @@ fun MyCollectionScreen(
     }
 }
 
-// ================== 4. 帖子详情页 ==================
 
 // ================== 4. 帖子详情页 ==================
 
@@ -503,7 +503,7 @@ fun PostDetailScreen(
     val currentUserId = userPreferences.userId
     val isAdmin = userPreferences.userRole == "admin" || userPreferences.userRole == "super_admin"
 
-    // 获取评论列表的抽离函数
+    // 1. 获取评论列表的逻辑
     fun fetchCommentsAndReplies() {
         scope.launch {
             try {
@@ -511,7 +511,8 @@ fun PostDetailScreen(
                 if (commentsResponse.isSuccessful && commentsResponse.body()?.code == 200) {
                     val fetchedComments = commentsResponse.body()?.data?.list ?: emptyList()
                     val commentsWithReplies = fetchedComments.map { comment ->
-                        async {
+                        // 加上 Dispatchers.IO 防止主线程卡顿
+                        async(kotlinx.coroutines.Dispatchers.IO) {
                             try {
                                 val repliesResponse = NetworkClient.instance.getRepliesByCommentId(commentId = comment.commentId, pageNum = 1, pageSize = 50)
                                 val fetchedReplies = if (repliesResponse.isSuccessful && repliesResponse.body()?.code == 200) {
@@ -531,6 +532,7 @@ fun PostDetailScreen(
         }
     }
 
+    // 2. 页面初始化加载逻辑 (修复了无限加载的问题)
     LaunchedEffect(postId) {
         isLoading = true
         try {
@@ -548,7 +550,7 @@ fun PostDetailScreen(
         }
     }
 
-    // 删除评论/回复的网络请求函数
+    // 3. 删除评论/回复的网络请求函数
     fun deleteCommentOrReply(commentId: Int?, replyId: Int?) {
         scope.launch {
             val token = userPreferences.token?.let { if (it.startsWith("Bearer ")) it else "Bearer $it" } ?: return@launch
@@ -567,6 +569,7 @@ fun PostDetailScreen(
         }
     }
 
+    // 4. 提交评论的逻辑
     fun submitComment() {
         if (inputText.isBlank()) return
         val currentInput = inputText
@@ -654,105 +657,165 @@ fun PostDetailScreen(
         }
     }
 
+    // ================== 全新重构的 UI 界面 ==================
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("帖子详情") },
-                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "返回") } },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.White)
+                title = { Text("帖子详情", fontSize = 18.sp, fontWeight = FontWeight.Bold) },
+                navigationIcon = {
+                    IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "返回") }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = Color.White,
+                    scrolledContainerColor = Color.White
+                )
             )
         },
-        containerColor = Color(0xFFF5F5F5)
+        containerColor = Color(0xFFF5F5F7) // 页面底色：高级灰
     ) { innerPadding ->
         Box(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
             if (isLoading) {
-                CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+                CircularProgressIndicator(modifier = Modifier.align(Alignment.Center), color = Color(0xFF2196F3))
             } else if (post == null) {
                 Text("未找到内容", modifier = Modifier.align(Alignment.Center), color = Color.Gray)
             } else {
                 val item = post!!
-                // 判断是否拥有全局删除权限 (管理员 或 帖主本身)
                 val hasGlobalDeletePermission = isAdmin || (item.userId == currentUserId)
 
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(bottom = 100.dp)
+                    contentPadding = PaddingValues(bottom = 100.dp) // 为底部输入框留白
                 ) {
+                    // --- 帖子正文卡片 ---
                     item {
-                        // 【修改 1】：增加 fillMaxWidth() 解决占不满屏幕的问题
-                        Column(modifier = Modifier.fillMaxWidth().background(Color.White).padding(16.dp)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                AvatarImage(
-                                    path = item.avatar,
-                                    modifier = Modifier.size(48.dp).clickable { onUserClick(item.userId) }
-                                )
-                                Spacer(modifier = Modifier.width(12.dp))
-                                Column {
-                                    // 【修改 3】：用户名称超过7个字限制显示
-                                    val rawName = item.username ?: "未知用户"
-                                    val displayUsername = if (rawName.length > 7) rawName.take(7) + "..." else rawName
-                                    Text(displayUsername, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                                    Text(item.createTime?.replace("T", " ")?.substringBefore(".") ?: "", color = Color.Gray, fontSize = 12.sp)
+                        Surface(
+                            color = Color.White,
+                            shadowElevation = 1.dp,
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                        ) {
+                            Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 24.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    AvatarImage(
+                                        path = item.avatar,
+                                        modifier = Modifier.size(44.dp).clip(CircleShape).clickable { onUserClick(item.userId) }
+                                    )
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Column {
+                                        val rawName = item.username ?: "未知用户"
+                                        val displayUsername = if (rawName.length > 7) rawName.take(7) + "..." else rawName
+                                        Text(displayUsername, fontWeight = FontWeight.ExtraBold, fontSize = 16.sp, color = Color(0xFF222222))
+
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        Surface(color = Color(0xFFF0F0F0), shape = RoundedCornerShape(4.dp)) {
+                                            Text(
+                                                text = item.createTime?.take(16)?.replace("T", " ") ?: "",
+                                                color = Color(0xFF777777),
+                                                fontSize = 11.sp,
+                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                            )
+                                        }
+                                    }
                                 }
-                            }
-                            Spacer(modifier = Modifier.height(16.dp))
-                            Text(item.title ?: "无标题", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(item.content ?: "无内容", fontSize = 16.sp, lineHeight = 24.sp)
-                            Spacer(modifier = Modifier.height(16.dp))
-                            if (!item.imgUrls.isNullOrEmpty()) {
-                                item.imgUrls.forEach { url ->
-                                    AsyncImage(model = url, contentDescription = null, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clip(RoundedCornerShape(8.dp)), contentScale = ContentScale.FillWidth)
+                                Spacer(modifier = Modifier.height(20.dp))
+                                Text(
+                                    text = item.title ?: "无标题",
+                                    fontSize = 22.sp,
+                                    fontWeight = FontWeight.Black,
+                                    color = Color(0xFF1A1A1A),
+                                    lineHeight = 30.sp
+                                )
+                                Spacer(modifier = Modifier.height(12.dp))
+                                Text(
+                                    text = item.content ?: "无内容",
+                                    fontSize = 16.sp,
+                                    lineHeight = 28.sp,
+                                    color = Color(0xFF333333)
+                                )
+                                Spacer(modifier = Modifier.height(16.dp))
+                                if (!item.imgUrls.isNullOrEmpty()) {
+                                    item.imgUrls.forEach { url ->
+                                        AsyncImage(
+                                            model = url,
+                                            contentDescription = null,
+                                            modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp).clip(RoundedCornerShape(12.dp)),
+                                            contentScale = ContentScale.FillWidth
+                                        )
+                                    }
                                 }
                             }
                         }
-                        Spacer(modifier = Modifier.height(8.dp))
                     }
 
+                    // --- 评论区标题 ---
                     item {
                         Surface(color = Color.White, modifier = Modifier.fillMaxWidth()) {
-                            Text("全部评论 (${comments.size + comments.sumOf { it.replies.size }})", modifier = Modifier.padding(16.dp), fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                            Text(
+                                text = "共 ${comments.size + comments.sumOf { it.replies.size }} 条评论",
+                                modifier = Modifier.padding(start = 20.dp, top = 20.dp, bottom = 10.dp),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 15.sp,
+                                color = Color(0xFF111111)
+                            )
                         }
-                        HorizontalDivider(color = Color(0xFFEEEEEE))
                     }
 
+                    // --- 评论列表 ---
                     items(comments, key = { it.commentId }) { comment ->
-                        CommentItemView(
-                            comment = comment,
-                            currentReplyTarget = currentReplyTarget,
-                            inputText = inputText,
-                            hasDeletePermission = hasGlobalDeletePermission,
-                            onInputTextChange = { inputText = it },
-                            onReplyClick = { target ->
-                                currentReplyTarget = if (currentReplyTarget == target) ReplyTarget.ToPost(postId) else target
-                            },
-                            onUserClick = onUserClick,
-                            onSubmit = { submitComment() },
-                            onDeleteClick = { cId, rId -> deleteCommentOrReply(cId, rId) }
-                        )
-                        HorizontalDivider(color = Color(0xFFEEEEEE), modifier = Modifier.padding(start = 56.dp))
+                        Surface(color = Color.White, modifier = Modifier.fillMaxWidth()) {
+                            CommentItemView(
+                                comment = comment,
+                                currentReplyTarget = currentReplyTarget,
+                                inputText = inputText,
+                                hasDeletePermission = hasGlobalDeletePermission,
+                                onInputTextChange = { inputText = it },
+                                onReplyClick = { target ->
+                                    currentReplyTarget = if (currentReplyTarget == target) ReplyTarget.ToPost(postId) else target
+                                },
+                                onUserClick = onUserClick,
+                                onSubmit = { submitComment() },
+                                onDeleteClick = { cId, rId -> deleteCommentOrReply(cId, rId) }
+                            )
+                        }
+                    }
+
+                    if (comments.isNotEmpty()) {
+                        item { Surface(color = Color.White, modifier = Modifier.fillMaxWidth().height(40.dp)) {} }
                     }
                 }
 
+                // --- 底部输入区 ---
                 if (currentReplyTarget is ReplyTarget.ToPost) {
                     Surface(
                         modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth(),
-                        shadowElevation = 8.dp,
+                        shadowElevation = 12.dp,
                         color = Color.White
                     ) {
-                        Row(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Row(
+                            modifier = Modifier.navigationBarsPadding().padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
                             OutlinedTextField(
                                 value = inputText,
                                 onValueChange = { if (it.length <= 200) inputText = it },
-                                placeholder = { Text("请输入评论...", color = Color.Gray) },
-                                modifier = Modifier.weight(1f).heightIn(min = 48.dp, max = 100.dp),
-                                shape = RoundedCornerShape(24.dp),
-                                colors = TextFieldDefaults.colors(focusedContainerColor = Color(0xFFF5F5F5), unfocusedContainerColor = Color(0xFFF5F5F5), focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent),
-                                trailingIcon = { Text("${inputText.length}/200", color = Color.Gray, fontSize = 12.sp, modifier = Modifier.padding(end = 12.dp)) }
+                                placeholder = { Text("说点什么吧...", color = Color.Gray, fontSize = 14.sp) },
+                                modifier = Modifier.weight(1f).heightIn(min = 44.dp, max = 100.dp),
+                                shape = RoundedCornerShape(22.dp),
+                                colors = TextFieldDefaults.colors(
+                                    focusedContainerColor = Color(0xFFF2F3F5),
+                                    unfocusedContainerColor = Color(0xFFF2F3F5),
+                                    focusedIndicatorColor = Color.Transparent,
+                                    unfocusedIndicatorColor = Color.Transparent
+                                ),
+                                textStyle = LocalTextStyle.current.copy(fontSize = 14.sp)
                             )
                             Spacer(modifier = Modifier.width(12.dp))
-                            Button(onClick = { submitComment() }, enabled = inputText.isNotBlank(), shape = RoundedCornerShape(24.dp), contentPadding = PaddingValues(horizontal = 16.dp)) {
-                                Text("发表")
+                            IconButton(
+                                onClick = { submitComment() },
+                                enabled = inputText.isNotBlank(),
+                                modifier = Modifier.size(44.dp).background(if(inputText.isNotBlank()) Color(0xFF2196F3) else Color(0xFFE0E0E0), CircleShape)
+                            ) {
+                                // 已经修复了这里的 tint 属性报错
+                                Icon(Icons.Default.Send, contentDescription = "发送", tint = Color.White, modifier = Modifier.size(20.dp).padding(end=2.dp, top=2.dp))
                             }
                         }
                     }
@@ -869,7 +932,11 @@ fun PostCard(
                 Spacer(modifier = Modifier.width(8.dp))
                 Column {
                     Text(post.username ?: "未知用户", fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                    Text(post.createTime?.replace("T", " ")?.substringBefore(".") ?: "", color = Color.Gray, fontSize = 12.sp)
+                    Text(
+                        text = post.createTime?.take(16)?.replace("T", " ") ?: "",
+                        color = Color.Gray,
+                        fontSize = 12.sp
+                    )
                 }
 
                 Spacer(modifier = Modifier.weight(1f))
@@ -1519,52 +1586,48 @@ fun CommentItemView(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(Color.White)
-            .padding(16.dp)
+            .padding(horizontal = 20.dp, vertical = 12.dp) // 拉大主评论间的呼吸感
     ) {
         // 主评论区
         Row(verticalAlignment = Alignment.Top) {
             AvatarImage(
                 path = comment.avatar,
-                modifier = Modifier.size(36.dp).clickable { onUserClick(comment.userId) }
+                modifier = Modifier.size(36.dp).clip(CircleShape).clickable { onUserClick(comment.userId) }
             )
             Spacer(modifier = Modifier.width(12.dp))
 
             Column(modifier = Modifier.weight(1f)) {
-                // 【修改 3】：评论者名字截断
                 val commentDisplayName = if (comment.username.length > 7) comment.username.take(7) + "..." else comment.username
 
-                // 昵称和时间行 (【修改 2】：已经移除了右上角的删除按钮)
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                    Text(commentDisplayName, fontWeight = FontWeight.Bold, color = Color(0xFF333333), fontSize = 14.sp)
-                    Text(comment.createTime.replace("T", " ").substringBefore("."), color = Color.Gray, fontSize = 12.sp)
-                }
-                Spacer(modifier = Modifier.height(4.dp))
-                // 评论内容
-                Text(comment.content, fontSize = 15.sp, color = Color.Black, lineHeight = 22.sp)
+                // 昵称
+                Text(commentDisplayName, fontWeight = FontWeight.Bold, color = Color(0xFF555555), fontSize = 14.sp)
 
-                // 交互行 (回复按钮 和 删除按钮)
-                Row(modifier = Modifier.fillMaxWidth().padding(top = 4.dp), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
-                    // 【修改 2】：主评论的删除按钮移到了下面
-                    if (hasDeletePermission) {
-                        Text(
-                            text = "删除",
-                            color = Color.Red,
-                            fontSize = 13.sp,
-                            modifier = Modifier
-                                .clickable { onDeleteClick(comment.commentId, null) }
-                                .padding(4.dp)
-                        )
-                        Spacer(modifier = Modifier.width(16.dp))
-                    }
+                Spacer(modifier = Modifier.height(4.dp))
+
+                // 评论内容
+                Text(comment.content, fontSize = 15.sp, color = Color(0xFF111111), lineHeight = 22.sp)
+
+                // 【优化 4】：时间和操作按钮同行，弱化“回复”和“删除”的视觉侵入感
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Text(
-                        text = "回复",
-                        color = Color(0xFF2196F3),
-                        fontSize = 13.sp,
-                        modifier = Modifier.clickable {
-                            onReplyClick(ReplyTarget.ToComment(comment.commentId, comment.userId, comment.username))
-                        }.padding(4.dp)
+                        text = comment.createTime.take(16).replace("T", " "),
+                        color = Color.Gray,
+                        fontSize = 12.sp
                     )
+
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (hasDeletePermission) {
+                            CommentActionButton(icon = Icons.Default.DeleteOutline, text = "删除", onClick = { onDeleteClick(comment.commentId, null) })
+                            Spacer(modifier = Modifier.width(16.dp))
+                        }
+                        CommentActionButton(icon = Icons.Outlined.Comment, text = "", onClick = {
+                            onReplyClick(ReplyTarget.ToComment(comment.commentId, comment.userId, comment.username))
+                        })
+                    }
                 }
 
                 // 动态弹出的内联输入框 (回复主评论)
@@ -1576,65 +1639,69 @@ fun CommentItemView(
                     onSubmit = onSubmit
                 )
 
-                // --- 嵌套回复区 ---
+                // --- 【优化 4】：嵌套回复区 (左侧引线设计) ---
                 if (comment.replies.isNotEmpty()) {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(top = 8.dp)
-                            .background(Color(0xFFF9F9F9), RoundedCornerShape(8.dp))
-                            .padding(12.dp)
+                            .padding(top = 12.dp)
+                            // 核心魔法：用 drawBehind 画一条浅灰色的左边框竖线
+                            .drawBehind {
+                                drawLine(
+                                    color = Color(0xFFEEEEEE),
+                                    start = Offset(0f, 0f),
+                                    end = Offset(0f, size.height),
+                                    strokeWidth = 2.dp.toPx()
+                                )
+                            }
+                            .padding(start = 12.dp) // 文字与引线的距离
                     ) {
-                        comment.replies.forEach { reply ->
-                            Column(modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                        comment.replies.forEachIndexed { index, reply ->
+                            Column(modifier = Modifier.fillMaxWidth().padding(bottom = if (index == comment.replies.lastIndex) 0.dp else 16.dp)) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     AvatarImage(
                                         path = reply.fromUserAvatar,
-                                        modifier = Modifier.size(24.dp).clickable { onUserClick(reply.fromUserId) }
+                                        modifier = Modifier.size(20.dp).clip(CircleShape).clickable { onUserClick(reply.fromUserId) }
                                     )
-                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
 
-                                    // 【修改 3】：回复者和被回复者名字截断
                                     val fromDisplayName = if (reply.fromUserName.length > 7) reply.fromUserName.take(7) + "..." else reply.fromUserName
                                     val toDisplayName = if (reply.toUserName.length > 7) reply.toUserName.take(7) + "..." else reply.toUserName
 
-                                    Text(fromDisplayName, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF555555))
-
-                                    if (true) {
-                                        Text(" 回复 ", fontSize = 13.sp, color = Color.Gray)
-                                        Text(toDisplayName, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF555555))
-                                    }
-
-                                    // 【修改 2】：已经移除了右上角的嵌套回复删除按钮
-                                    Spacer(modifier = Modifier.weight(1f))
-                                    Text(reply.createTime.replace("T", " ").substringBefore("."), color = Color.Gray, fontSize = 11.sp)
+                                    Text(fromDisplayName, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF666666))
+                                    Text(" 回复 ", fontSize = 12.sp, color = Color(0xFFAAAAAA))
+                                    Text(toDisplayName, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF666666))
                                 }
 
                                 Text(
                                     text = reply.content,
                                     fontSize = 14.sp,
-                                    modifier = Modifier.padding(start = 32.dp, top = 4.dp)
+                                    color = Color(0xFF333333),
+                                    lineHeight = 20.sp,
+                                    modifier = Modifier.padding(start = 26.dp, top = 4.dp)
                                 )
 
-                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
-                                    // 【修改 2】：子回复的删除按钮移到了下面
-                                    if (hasDeletePermission) {
-                                        Text(
-                                            text = "删除",
-                                            color = Color.Red,
-                                            fontSize = 12.sp,
-                                            modifier = Modifier
-                                                .clickable { onDeleteClick(null, reply.replyId) }
-                                                .padding(4.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(16.dp))
-                                    }
+                                // 子回复的时间与操作
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(start = 26.dp, top = 6.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
                                     Text(
-                                        text = "回复", color = Color(0xFF2196F3), fontSize = 12.sp,
-                                        modifier = Modifier.clickable {
-                                            onReplyClick(ReplyTarget.ToReply(comment.commentId, reply.replyId, reply.fromUserId, reply.fromUserName))
-                                        }.padding(4.dp)
+                                        text = comment.createTime.take(16).replace("T", " "),
+                                        color = Color.Gray,
+                                        fontSize = 12.sp
                                     )
+
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        if (hasDeletePermission) {
+                                            CommentActionButton(icon = Icons.Default.DeleteOutline, text = "删除", onClick = { onDeleteClick(null, reply.replyId) })
+                                            Spacer(modifier = Modifier.width(16.dp))
+                                        }
+                                        CommentActionButton(icon = Icons.Outlined.Comment, text = "", onClick = {
+                                            onReplyClick(ReplyTarget.ToReply(comment.commentId, reply.replyId, reply.fromUserId, reply.fromUserName))
+                                        })
+                                    }
                                 }
 
                                 // 动态弹出的内联输入框 (回复子评论)
@@ -1654,35 +1721,69 @@ fun CommentItemView(
     }
 }
 
+// 【新增】：用于统一弱化操作按钮的辅助组件
+@Composable
+fun CommentActionButton(icon: androidx.compose.ui.graphics.vector.ImageVector, text: String, onClick: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clickable(onClick = onClick)
+            .padding(4.dp)
+    ) {
+        Icon(icon, contentDescription = null, tint = Color(0xFF999999), modifier = Modifier.size(14.dp))
+        Spacer(modifier = Modifier.width(4.dp))
+        Text(text = text, color = Color(0xFF999999), fontSize = 12.sp, fontWeight = FontWeight.Medium)
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OtherUserProfileScreen(
     targetUserId: Int,
     userPreferences: UserPreferences,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onPostClick: (Int) -> Unit = {}, // 【新增】用于跳转到帖子详情
+    onUserClick: (Int) -> Unit = {}  // 【新增】传递用户点击事件
 ) {
     var profile by remember { mutableStateOf<UserProfile?>(null) }
     var isLoading by remember { mutableStateOf(true) }
     var isFollowing by remember { mutableStateOf(false) }
     var isActionLoading by remember { mutableStateOf(false) } // 防止重复点击
+
+    // 【新增】TA的帖子列表状态
+    var userPosts by remember { mutableStateOf<List<CommunityPostItem>>(emptyList()) }
+    var isPostsLoading by remember { mutableStateOf(true) }
+
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val token = userPreferences.token?.let { if (it.startsWith("Bearer ")) it else "Bearer $it" } ?: ""
 
-    // 加载资料
+    // 【修改】并发加载用户资料和TA的帖子
     LaunchedEffect(targetUserId) {
+        isLoading = true
+        isPostsLoading = true
         try {
-            // 根据你的 ApiService 定义，这里传入 UserProfileRequest
-            val res = NetworkClient.instance.getUserProfile(token, targetUserId)
+            // 使用 async 并发请求，提高加载速度
+            val profileDeferred = async { NetworkClient.instance.getUserProfile(token, targetUserId) }
+            val postsDeferred = async { NetworkClient.instance.getCommunityPostsByFilter(pageNum = 1, pageSize = 50, postUserId = targetUserId) }
+
+            // 1. 处理个人资料响应
+            val res = profileDeferred.await()
             if (res.isSuccessful && res.body()?.code == 200) {
-                Log.d("followDebug","${res.body()?.data}")
                 profile = res.body()?.data
                 isFollowing = res.body()?.data?.isFollow ?: false
             }
+
+            // 2. 处理帖子列表响应
+            val postsRes = postsDeferred.await()
+            if (postsRes.isSuccessful && postsRes.body()?.code == 200) {
+                userPosts = postsRes.body()?.data?.list ?: emptyList()
+            }
         } catch (e: Exception) {
-            Toast.makeText(context, "加载资料失败", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, "加载数据异常", Toast.LENGTH_SHORT).show()
         } finally {
             isLoading = false
+            isPostsLoading = false
         }
     }
 
@@ -1694,7 +1795,6 @@ fun OtherUserProfileScreen(
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.White)
             )
         },
-        // 增加灰色背景，让白色的卡片立体感更强
         containerColor = Color(0xFFF5F5F5)
     ) { padding ->
         if (isLoading) {
@@ -1702,92 +1802,86 @@ fun OtherUserProfileScreen(
                 CircularProgressIndicator()
             }
         } else profile?.let { data ->
-            Column(
-                modifier = Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState())
+            // 【修改】将 Column 替换为 LazyColumn 以优化长列表性能
+            LazyColumn(
+                modifier = Modifier.fillMaxSize().padding(padding),
+                contentPadding = PaddingValues(bottom = 40.dp) // 底部留白
             ) {
                 // ================= 1. 头部资料卡片 =================
-                Card(
-                    modifier = Modifier.fillMaxWidth().padding(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color.White),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-                ) {
-                    // 【关键修复】：加上 fillMaxWidth() 并设置水平居中
-                    Column(
-                        modifier = Modifier.fillMaxWidth().padding(20.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
+                item {
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color.White),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
                     ) {
-                        AvatarImage(path = data.userInfoVO.avatar, modifier = Modifier.size(80.dp).clip(CircleShape))
-                        Spacer(Modifier.height(12.dp))
-                        Text(data.userInfoVO.username, fontWeight = FontWeight.Bold, fontSize = 20.sp)
-
-                        // 角色标签
-                        Surface(
-                            color = if (data.role == "admin") Color(0xFFFFEBEE) else Color(0xFFE3F2FD),
-                            shape = RoundedCornerShape(4.dp),
-                            modifier = Modifier.padding(vertical = 8.dp)
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(20.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            Text(
-                                if (data.role == "admin") "管理员" else "普通用户",
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                                color = if (data.role == "admin") Color.Red else Color(0xFF1976D2),
-                                fontSize = 12.sp
-                            )
-                        }
+                            AvatarImage(path = data.userInfoVO.avatar, modifier = Modifier.size(80.dp).clip(CircleShape))
+                            Spacer(Modifier.height(12.dp))
+                            Text(data.userInfoVO.username, fontWeight = FontWeight.Bold, fontSize = 20.sp)
 
-                        Text(data.userInfoVO.userSignature ?: "这个人很懒，什么都没写~", color = Color.Gray, fontSize = 14.sp)
-
-                        Spacer(Modifier.height(16.dp))
-
-                        // 关注按钮逻辑 (不能关注自己)
-                        if (data.userInfoVO.userId.toInt() != userPreferences.userId) {
-                            Button(
-                                onClick = {
-                                    if (isActionLoading) return@Button
-                                    isActionLoading = true
-                                    scope.launch {
-                                        // ⚠️ 注意：请确保 FollowUserRequest 里的参数名（如 followeeId）与你 Apifox 接口文档中要求的一模一样
-                                        try {
-                                            val res = if (isFollowing) {
-                                                NetworkClient.instance.cancelFollowUser(token, targetUserId)
-                                            } else {
-                                                NetworkClient.instance.followUser(token, targetUserId)
-                                            }
-
-                                            // 打印出后端返回的真实状态码和提示信息
-                                            Log.d("followDebug", "真实请求结果 -> Code: ${res.body()?.code}, Msg: ${res.body()?.msg}")
-
-                                            // 【核心修复】：必须确保网络请求成功，且业务状态码 code 为 200 才算真正成功
-                                            if (res.isSuccessful && res.body()?.code == 200) {
-                                                isFollowing = !isFollowing
-                                                Toast.makeText(context, if (isFollowing) "关注成功" else "已取消关注", Toast.LENGTH_SHORT).show()
-                                            } else {
-                                                // 如果后端校验失败，将后端的报错信息（msg）直接显示在屏幕上
-                                                val errorMsg = res.body()?.msg ?: "未知错误"
-                                                Toast.makeText(context, "操作失败: $errorMsg", Toast.LENGTH_SHORT).show()
-
-                                                // 强制将按钮状态回滚/保持为原来的状态（防止UI欺骗）
-                                                Log.e("followDebug", "后端拒绝了请求，原因: $errorMsg")
-                                            }
-                                        } catch (e: Exception) {
-                                            e.printStackTrace()
-                                            Toast.makeText(context, "操作异常，请检查网络: ${e.message}", Toast.LENGTH_SHORT).show()
-                                        } finally {
-                                            isActionLoading = false
-                                        }
-                                    }
-                                },
-                                shape = RoundedCornerShape(20.dp),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (isFollowing) Color.LightGray else Color(0xFF2196F3)
-                                )
+                            // 角色标签
+                            Surface(
+                                color = if (data.role == "admin") Color(0xFFFFEBEE) else Color(0xFFE3F2FD),
+                                shape = RoundedCornerShape(4.dp),
+                                modifier = Modifier.padding(vertical = 8.dp)
                             ) {
-                                if (isActionLoading) {
-                                    CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White)
-                                } else {
-                                    Text(
-                                        text = if (isFollowing) "取消关注" else "+ 关注",
-                                        color = if (isFollowing) Color.DarkGray else Color.White
+                                Text(
+                                    if (data.role == "admin") "管理员" else "普通用户",
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                                    color = if (data.role == "admin") Color.Red else Color(0xFF1976D2),
+                                    fontSize = 12.sp
+                                )
+                            }
+
+                            Text(data.userInfoVO.userSignature ?: "这个人很懒，什么都没写~", color = Color.Gray, fontSize = 14.sp)
+
+                            Spacer(Modifier.height(16.dp))
+
+                            // 关注按钮逻辑 (不能关注自己)
+                            if (data.userInfoVO.userId.toInt() != userPreferences.userId) {
+                                Button(
+                                    onClick = {
+                                        if (isActionLoading) return@Button
+                                        isActionLoading = true
+                                        scope.launch {
+                                            try {
+                                                val res = if (isFollowing) {
+                                                    NetworkClient.instance.cancelFollowUser(token, targetUserId)
+                                                } else {
+                                                    NetworkClient.instance.followUser(token, targetUserId)
+                                                }
+
+                                                if (res.isSuccessful && res.body()?.code == 200) {
+                                                    isFollowing = !isFollowing
+                                                    Toast.makeText(context, if (isFollowing) "关注成功" else "已取消关注", Toast.LENGTH_SHORT).show()
+                                                } else {
+                                                    val errorMsg = res.body()?.msg ?: "未知错误"
+                                                    Toast.makeText(context, "操作失败: $errorMsg", Toast.LENGTH_SHORT).show()
+                                                }
+                                            } catch (e: Exception) {
+                                                e.printStackTrace()
+                                                Toast.makeText(context, "操作异常，请检查网络", Toast.LENGTH_SHORT).show()
+                                            } finally {
+                                                isActionLoading = false
+                                            }
+                                        }
+                                    },
+                                    shape = RoundedCornerShape(20.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (isFollowing) Color.LightGray else Color(0xFF2196F3)
                                     )
+                                ) {
+                                    if (isActionLoading) {
+                                        CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White)
+                                    } else {
+                                        Text(
+                                            text = if (isFollowing) "取消关注" else "+ 关注",
+                                            color = if (isFollowing) Color.DarkGray else Color.White
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -1795,42 +1889,83 @@ fun OtherUserProfileScreen(
                 }
 
                 // ================= 2. 统计数据模块 =================
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    StatBox("帖子", data.communityStatisticDto.postNum, Modifier.weight(1f))
-                    StatBox("获赞", data.communityStatisticDto.getLikeNum, Modifier.weight(1f))
-                    StatBox("粉丝", data.communityStatisticDto.fansNum, Modifier.weight(1f))
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        StatBox("帖子", data.communityStatisticDto.postNum, Modifier.weight(1f))
+                        StatBox("获赞", data.communityStatisticDto.getLikeNum, Modifier.weight(1f))
+                        StatBox("粉丝", data.communityStatisticDto.fansNum, Modifier.weight(1f))
+                    }
                 }
 
                 // ================= 3. 志愿者资料模块 =================
-                // 只有当 volunteerDataVO 不为空时才显示这块区域
                 data.volunteerDataVO?.let { vol ->
-                    Spacer(Modifier.height(16.dp))
-                    Text("志愿者信息", Modifier.padding(horizontal = 16.dp), fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                    Card(
-                        modifier = Modifier.fillMaxWidth().padding(16.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color.White),
-                        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-                    ) {
-                        Column(Modifier.padding(16.dp)) {
-                            // 【核心修复】：加上 ?: "未知" 和 ?: "未提供" 防止后端传 null 导致崩溃
-                            InfoRow("年级", vol.grade ?: "未知")
-                            InfoRow("完成率", "${(vol.finishRate * 100).toInt()}%")
-                            InfoRow("联系方式", vol.contactNumber ?: "未提供")
+                    item {
+                        Spacer(Modifier.height(16.dp))
+                        Text("志愿者信息", Modifier.padding(horizontal = 16.dp), fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                        Card(
+                            modifier = Modifier.fillMaxWidth().padding(16.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color.White),
+                            elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                        ) {
+                            Column(Modifier.padding(16.dp)) {
+                                InfoRow("年级", vol.grade ?: "未知")
+                                InfoRow("完成率", "${(vol.finishRate * 100).toInt()}%")
+                                InfoRow("联系方式", vol.contactNumber ?: "未提供")
+                            }
                         }
                     }
                 }
+
                 // ================= 4. 底部其他信息 =================
-                Spacer(Modifier.height(16.dp))
-                Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
-                    Text("最后登录: ${data.lastLoginTime ?: "未知"}", color = Color.Gray, fontSize = 12.sp)
-                    Spacer(Modifier.height(4.dp))
-                    Text("主页访问量: ${data.visitedNum}", color = Color.Gray, fontSize = 12.sp)
+                item {
+                    Spacer(Modifier.height(16.dp))
+                    Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                        Text("最后登录: ${data.lastLoginTime ?: "未知"}", color = Color.Gray, fontSize = 12.sp)
+                        Spacer(Modifier.height(4.dp))
+                        Text("主页访问量: ${data.visitedNum}", color = Color.Gray, fontSize = 12.sp)
+                    }
                 }
 
-                Spacer(Modifier.height(40.dp)) // 页面底部留白
+                // ================= 5. 【新增】TA的帖子展示区域 =================
+                item {
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        text = "TA的帖子",
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.DarkGray
+                    )
+                }
+
+                if (isPostsLoading) {
+                    item {
+                        Box(modifier = Modifier.fillMaxWidth().height(100.dp), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator()
+                        }
+                    }
+                } else if (userPosts.isEmpty()) {
+                    item {
+                        Box(modifier = Modifier.fillMaxWidth().height(100.dp), contentAlignment = Alignment.Center) {
+                            Text("暂无发布内容", color = Color.Gray)
+                        }
+                    }
+                } else {
+                    // 使用 items 循环渲染该用户的帖子
+                    items(userPosts, key = { it.postId }) { post ->
+                        PostCard(
+                            post = post,
+                            onFavoriteToggle = { /* 在别人主页一般不直接处理收藏逻辑，或者可接入你的已有逻辑 */ },
+                            onLikeToggle = { Toast.makeText(context, "请在社区主页进行点赞操作", Toast.LENGTH_SHORT).show() },
+                            onDeleteSuccess = { /* 管理员删除后的刷新逻辑可在这里补充 */ },
+                            onUserClick = onUserClick,
+                            onClick = { onPostClick(post.postId) }
+                        )
+                    }
+                }
             }
         }
     }

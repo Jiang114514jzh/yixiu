@@ -23,7 +23,9 @@ data class RepairTaskRequest(
     val appointmentTime: String,
 
     @SerializedName("remarks")
-    val remarks: String?
+    val remarks: String?,
+
+    val category: String? = null
 )
 
 data class RepairHistoryItem(
